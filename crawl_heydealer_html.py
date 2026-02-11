@@ -11,27 +11,37 @@ TEST_LIMIT = 10
 BASE_URL = "https://www.heydealer.com"
 BASE_DIR = Path(__file__).resolve().parent
 RESULT_DIR = BASE_DIR / "result"
-IMG_DIR = BASE_DIR / "image" / "heydealer"  # 이미지 저장 경로
+IMG_DIR = BASE_DIR / "image" / "heydealer"
 
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 IMG_DIR.mkdir(parents=True, exist_ok=True)
 
+def get_now_times():
+    """요청하신 형식의 날짜 데이터 생성"""
+    now = datetime.now()
+    # 202602111328 형식 (YYYYMMDDHHMI) - 12자리
+    creat_de = now.strftime("%Y%m%d%H%M")
+    # 20260211 형식 (YYYYMMDD) - 8자리
+    data_crtr_pnttm = now.strftime("%Y%m%d")
+    return data_crtr_pnttm, creat_de
+
 def download_image(img_url, model_cd, idx):
-    """이미지를 로컬 폴더에 저장"""
+    """이미지를 로컬 ./image/heydealer 폴더에 저장"""
     try:
         if not img_url: return
         response = requests.get(img_url, stream=True, timeout=10)
         if response.status_code == 200:
-            ext = img_url.split('.')[-1].split('?')[0] # 확장자 추출
+            ext = img_url.split('.')[-1].split('?')[0]
             filename = f"{model_cd}_{idx}.{ext}"
             save_path = IMG_DIR / filename
             with open(save_path, 'wb') as f:
                 for chunk in response.iter_content(1024):
                     f.write(chunk)
-    except Exception as e:
-        print(f"   ⚠️ 이미지 다운로드 실패 ({model_cd}): {e}")
+    except:
+        pass
 
 def _extract_card_heydealer(elem, idx) -> dict:
+    """목록 정보 수집"""
     data = {"model_sn": idx}
     try:
         href = elem.get_attribute("href") or ""
@@ -69,20 +79,27 @@ def _extract_card_heydealer(elem, idx) -> dict:
         data["accident"] = info_tags[0].inner_text().strip() if len(info_tags) > 0 else ""
         data["insurance"] = info_tags[1].inner_text().strip() if len(info_tags) > 1 else ""
 
-        data["create_dt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 날짜 정보 추가
+        d_pnttm, c_dt = get_now_times()
+        data["date_crtr_pnttm"] = d_pnttm
+        data["create_dt"] = c_dt
     except: pass
     return data
 
 def _extract_detail_smart(page, idx, model_cd) -> dict:
+    """상세 정보 (이름, 등급, 옵션, 이미지) 정밀 수집"""
     res = {"model_sn": idx, "model_cd": model_cd}
     try:
-        page.wait_for_selector(".css-1ugrlhy", timeout=15000)
-        container = page.query_selector(".css-12qft46")
-        if not container: return res
-        
+        page.wait_for_selector(".css-12qft46", timeout=15000)
+        # 전체를 감싸는 컨테이너 확인
+        container = page.query_selector(".css-1uus6sd .css-12qft46")
+        if not container:
+            return res
+            
         sections = container.query_selector_all(".css-ltrevz")
         
-        # [섹션 1] 기본 정보
+        # --- [섹션 1] 차량명 및 기본 스펙 (요청하신 이름 로직) ---
+        # --- 1. 텍스트 데이터 수집 (기존 로직 유지) ---
         if len(sections) >= 1:
             sec1 = sections[0]
             m_name_el = sec1.query_selector(".css-1ugrlhy")
@@ -96,47 +113,46 @@ def _extract_detail_smart(page, idx, model_cd) -> dict:
             items = sec1.query_selector_all(".css-113wzqa")
             for i, item in enumerate(items):
                 if i < len(keys):
-                    val = item.query_selector("div:not(.css-1b7o1k1)")
+                    val = item.query_selector(".css-1b7o1k1 + div")
                     res[keys[i]] = val.inner_text().strip() if val else ""
 
-        # [섹션 2] 색상
+        # --- [섹션 2] 색상 수집 ---
         if len(sections) >= 2:
             color_items = sections[1].query_selector_all(".css-113wzqa")
-            if len(color_items) >= 1:
-                res["color_ext"] = color_items[0].query_selector("div:not(.css-1b7o1k1)").inner_text().strip()
-            if len(color_items) >= 2:
-                res["color_int"] = color_items[1].query_selector("div:not(.css-1b7o1k1)").inner_text().strip()
+            if len(color_items) >= 1: res["color_ext"] = color_items[0].query_selector(".css-1b7o1k1 + div").inner_text().strip()
+            if len(color_items) >= 2: res["color_int"] = color_items[1].query_selector(".css-1b7o1k1 + div").inner_text().strip()
 
-        # [섹션 4] 관리상태 데이터값 및 이미지
+        # --- [섹션 3] 주요 옵션 (이전 요청대로 유지) ---
+        if len(sections) >= 3:
+            sec3 = sections[2]
+            option_elements = sec3.query_selector_all(".css-5pr39e .css-1i3qy3r .css-vsdo2k .css-g5wwb2 .css-13wylk3")
+            options = [opt.inner_text().strip() for opt in option_elements if opt.inner_text().strip()]
+            res["main_option"] = ", ".join(options)
+
+        # --- [섹션 4] 관리상태 및 이미지 수집 (유지) ---
         if len(sections) >= 4:
             sec4 = sections[3]
-            # 관리 정보 아이템들 (.css-113wzqa)
             mgmt_items = sec4.query_selector_all(".css-113wzqa")
-            
-            # 1. 타이어 (첫 번째 항목)
-            if len(mgmt_items) >= 1:
-                # css-1b7o1k1(라벨)과 같은 선상에 있는 뒷순서 div 추출
-                res["tire"] = mgmt_items[0].query_selector(".css-1b7o1k1 + div").inner_text().strip()
-            
-            # 2. 틴팅 (두 번째 항목 - "앞 31%..." 데이터 추출)
-            if len(mgmt_items) >= 2:
-                # .css-1b7o1k1 클래스 바로 옆에 붙어 있는 div만 콕 집어서 가져옵니다.
-                # 이 방식은 내부의 svg나 css-97t8oi에 전혀 간섭받지 않습니다.
-                target_div = mgmt_items[1].query_selector(".css-1b7o1k1 + div")
-                res["tinting"] = target_div.inner_text().strip() if target_div else ""
-            
-            # 3. 차 키 (세 번째 항목)
-            if len(mgmt_items) >= 3:
-                res["car_key"] = mgmt_items[2].query_selector(".css-1b7o1k1 + div").inner_text().strip()
+            if len(mgmt_items) >= 1: res["tire"] = mgmt_items[0].query_selector(".css-1b7o1k1 + div").inner_text().strip()
+            if len(mgmt_items) >= 2: res["tinting"] = mgmt_items[1].query_selector(".css-1b7o1k1 + div").inner_text().strip()
+            if len(mgmt_items) >= 3: res["car_key"] = mgmt_items[2].query_selector(".css-1b7o1k1 + div").inner_text().strip()
 
-            # 이미지 저장 로직 (이미지 url이 포함된 class="css-w9nhgi"는 위 div들과 같은 선상(sibling)에 있음)
-            images = sec4.query_selector_all(".css-w9nhgi img")
-            for i, img in enumerate(images):
-                src = img.get_attribute("src")
-                if src: download_image(src, model_cd, i+1)
+        # 이미지 수집 (모든 타겟 클래스 포함)
+        target_images = []
+        if len(sections) >= 2: target_images.extend(sections[1].query_selector_all("img"))
+        if len(sections) >= 4: target_images.extend(sections[3].query_selector_all("img"))
+        target_images.extend(page.query_selector_all(".css-w9nhgi img, .css-q47uzu img, .css-1a3591h img"))
 
-        # 기타 공통 데이터
-        res["main_option"] = ", ".join([o.inner_text().strip() for o in page.query_selector_all(".css-vsdo2k")])
+        downloaded_urls = set()
+        img_idx = 1
+        for img in target_images:
+            src = img.get_attribute("src")
+            if src and src not in downloaded_urls:
+                download_image(src, model_cd, img_idx)
+                downloaded_urls.add(src)
+                img_idx += 1
+
+        # 기타 정보
         ship = page.query_selector(".css-1n3oo4w")
         res["Shipping_information"] = ship.inner_text().strip() if ship else ""
         rec = page.query_selector(".css-yfldxx")
@@ -170,42 +186,59 @@ def main():
                     if len(raw_list) >= TEST_LIMIT: break
 
         # 목록 저장
-        list_fields = ["model_sn", "model_cd", "model_name", "model_second_name", "grade_name", "year", "km", "before_sale", "sale_price", "new_car_price", "accident", "insurance", "detail_url", "create_dt"]
+        list_fields = ["model_sn", "model_cd", "model_name", "model_second_name", "grade_name", "year", "km", "before_sale", "sale_price", "new_car_price", "accident", "insurance", "detail_url", "date_crtr_pnttm", "create_dt"]
         with open(RESULT_DIR / "heydealer_list.csv", "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=list_fields, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(raw_list)
+        print(f"✅ 목록 수집 완료 → 경로: {RESULT_DIR / 'heydealer_list.csv'} | 파일명: heydealer_list.csv")
 
         # 상세 수집
         detail_results = []
-        detail_fields = ["model_sn", "model_cd", "model_name", "model_second_name", "grade_name", "year", "km", "refund", "guarantee", "accident", "inner_car_wash", "insurance", "color_ext", "color_int", "main_option", "Shipping_information", "rec_reason", "tire", "tinting", "car_key", "detail_url", "create_dt"]
+        detail_fields = ["model_sn", "model_cd", "model_name", "model_second_name", "grade_name", "year", "km", "refund", "guarantee", "accident", "inner_car_wash", "insurance", "color_ext", "color_int", "main_option", "Shipping_information", "rec_reason", "tire", "tinting", "car_key", "detail_url", "date_crtr_pnttm", "create_dt"]
 
+        max_retries = 2
         for item in raw_list:
             success = False
-            for retry in range(2):
-                print(f"🔍 상세 수집 중: {item['model_cd']} (시도 {retry+1}/2)")
+            for retry in range(max_retries):
+                if retry == 0:
+                    print(f"🔍 상세 수집 중: {item['model_cd']}")
+                else:
+                    remaining = max_retries - retry - 1
+                    print(f"🚨 상세 재수집 중: {item['model_cd']} (남은 횟수 {remaining})")
                 try:
-                    page.goto(item["detail_url"], wait_until="domcontentloaded", timeout=30000)
+                    page.goto(item["detail_url"], wait_until="domcontentloaded", timeout=40000)
                     time.sleep(3)
                     detail = _extract_detail_smart(page, item["model_sn"], item["model_cd"])
                     if detail.get("model_name"):
-                        detail.update({"detail_url": item["detail_url"], "create_dt": item["create_dt"]})
+                        # 날짜 정보 동기화
+                        detail.update({
+                            "detail_url": item["detail_url"], 
+                            "date_crtr_pnttm": item["date_crtr_pnttm"], 
+                            "create_dt": item["create_dt"]
+                        })
                         detail_results.append(detail)
                         success = True
+                        if retry > 0:
+                            print(f"   ✅ 재수집 성공: {item['model_cd']}")
                         break
-                except Exception as e:
-                    print(f"   ❌ 로딩 실패 ({e})")
+                except:
                     time.sleep(2)
             
             if not success:
-                detail_results.append({"model_sn": item["model_sn"], "model_cd": item["model_cd"], "detail_url": item["detail_url"], "create_dt": item["create_dt"]})
+                print(f"   ❌ 상세 수집 실패: {item['model_cd']} (재시도 후에도 미수집)")
+                detail_results.append({
+                    "model_sn": item["model_sn"], "model_cd": item["model_cd"], 
+                    "detail_url": item["detail_url"], "date_crtr_pnttm": item["date_crtr_pnttm"], "create_dt": item["create_dt"]
+                })
 
         with open(RESULT_DIR / "heydealer_detail.csv", "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=detail_fields, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(detail_results)
+        print(f"✅ 상세 수집 완료 → 경로: {RESULT_DIR / 'heydealer_cars_detail.csv'} | 파일명: heydealer_cars_detail.csv")
         
-        print("✅ 모든 수집 및 이미지 저장 완료")
+        print("✅ 모든 수집 완료")
         browser.close()
 
 if __name__ == "__main__":
