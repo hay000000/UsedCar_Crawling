@@ -86,20 +86,25 @@ def _extract_card_heydealer(elem, idx) -> dict:
     except: pass
     return data
 
+def clean_text_to_pipe(raw_text):
+    """오직 줄바꿈만 파이프로 변경하여 원본 데이터 보존"""
+    if not raw_text: return ""
+    # 줄바꿈을 기준으로 나누고, 각 줄의 앞뒤 공백만 제거한 뒤 파이프로 연결
+    lines = [line.strip() for line in raw_text.split('\n') if line.strip()]
+    return " | ".join(lines)
+
 def _extract_detail_smart(page, idx, model_cd) -> dict:
-    """상세 정보 (이름, 등급, 옵션, 이미지) 정밀 수집"""
+    """상세 정보 수집 - 요청하신 2개 컬럼만 파이프 적용"""
     res = {"model_sn": idx, "model_cd": model_cd}
     try:
         page.wait_for_selector(".css-12qft46", timeout=15000)
-        # 전체를 감싸는 컨테이너 확인
         container = page.query_selector(".css-1uus6sd .css-12qft46")
-        if not container:
-            return res
+        if not container: return res
             
         sections = container.query_selector_all(".css-ltrevz")
         
-        # --- [섹션 1] 차량명 및 기본 스펙 (요청하신 이름 로직) ---
-        # --- 1. 텍스트 데이터 수집 (기존 로직 유지) ---
+        # --- [섹션 1] 차량명 및 기본 스펙 ---
+        # --- [섹션 1] 이름 및 year ~ insurance 영역 ---
         if len(sections) >= 1:
             sec1 = sections[0]
             m_name_el = sec1.query_selector(".css-1ugrlhy")
@@ -110,34 +115,55 @@ def _extract_detail_smart(page, idx, model_cd) -> dict:
             elif len(v_spans) >= 2: res["model_second_name"], res["grade_name"] = v_spans[0], v_spans[1]
 
             keys = ["year", "km", "refund", "guarantee", "accident", "inner_car_wash", "insurance"]
-            items = sec1.query_selector_all(".css-113wzqa")
-            for i, item in enumerate(items):
-                if i < len(keys):
-                    val = item.query_selector(".css-1b7o1k1 + div")
-                    res[keys[i]] = val.inner_text().strip() if val else ""
 
-        # --- [섹션 2] 색상 수집 ---
+
+            # [핵심] 텍스트 매칭 로직: 인덱스가 아니라 '연식', '주행거리'라는 글자를 보고 저장함
+            # 데이터가 없으면 해당 if문에 안 걸리므로 그냥 빈값("")으로 남음 (밀림 방지)
+            items = sec1.query_selector_all(".css-113wzqa")
+            for item in items:
+                label_el = item.query_selector(".css-1b7o1k1") # '연식', '주행거리' 등이 적힌 곳
+                val_el = item.query_selector(".css-1b7o1k1 + div") # 실제 데이터가 적힌 곳
+                
+                if label_el and val_el:
+                    label = label_el.inner_text().strip()
+                    value = val_el.inner_text().strip()
+                    
+                    if "연식" in label: res["year"] = value
+                    elif "주행거리" in label: res["km"] = value
+                    elif "환불" in label: res["refund"] = value
+                    elif "보증" in label: res["guarantee"] = value
+                    elif "사고" in label: res["accident"] = value
+                    elif "실내세차" in label: res["inner_car_wash"] = value
+                    elif "보험" in label: res["insurance"] = value
+
+        # --- [섹션 2] 색상 ---
         if len(sections) >= 2:
             color_items = sections[1].query_selector_all(".css-113wzqa")
             if len(color_items) >= 1: res["color_ext"] = color_items[0].query_selector(".css-1b7o1k1 + div").inner_text().strip()
             if len(color_items) >= 2: res["color_int"] = color_items[1].query_selector(".css-1b7o1k1 + div").inner_text().strip()
 
-        # --- [섹션 3] 주요 옵션 (이전 요청대로 유지) ---
+        # --- [섹션 3] 옵션 및 출고 정보 ---
         if len(sections) >= 3:
             sec3 = sections[2]
+            # 주요 옵션 (쉼표 유지)
             option_elements = sec3.query_selector_all(".css-5pr39e .css-1i3qy3r .css-vsdo2k .css-g5wwb2 .css-13wylk3")
-            options = [opt.inner_text().strip() for opt in option_elements if opt.inner_text().strip()]
-            res["main_option"] = ", ".join(options)
+            res["main_option"] = ", ".join([opt.inner_text().strip() for opt in option_elements if opt.inner_text().strip()])
 
-        # --- [섹션 4] 관리상태 및 이미지 수집 (유지) ---
+            # 1) delivery_information (파이프 적용 대상)
+            ship_el = sec3.query_selector(".css-1cfq7ri .css-1n3oo4w")
+            res["delivery_information"] = clean_text_to_pipe(ship_el.inner_text()) if ship_el else ""
+
+        # --- [섹션 4] 관리상태 (원본 데이터 유지) ---
         if len(sections) >= 4:
             sec4 = sections[3]
             mgmt_items = sec4.query_selector_all(".css-113wzqa")
-            if len(mgmt_items) >= 1: res["tire"] = mgmt_items[0].query_selector(".css-1b7o1k1 + div").inner_text().strip()
-            if len(mgmt_items) >= 2: res["tinting"] = mgmt_items[1].query_selector(".css-1b7o1k1 + div").inner_text().strip()
-            if len(mgmt_items) >= 3: res["car_key"] = mgmt_items[2].query_selector(".css-1b7o1k1 + div").inner_text().strip()
+            keys_mgmt = ["tire", "tinting", "car_key"]
+            for i, item in enumerate(mgmt_items):
+                if i < len(keys_mgmt):
+                    val = item.query_selector(".css-1b7o1k1 + div")
+                    res[keys_mgmt[i]] = val.inner_text().strip() if val else ""
 
-        # 이미지 수집 (모든 타겟 클래스 포함)
+        # 이미지 수집
         target_images = []
         if len(sections) >= 2: target_images.extend(sections[1].query_selector_all("img"))
         if len(sections) >= 4: target_images.extend(sections[3].query_selector_all("img"))
@@ -147,16 +173,14 @@ def _extract_detail_smart(page, idx, model_cd) -> dict:
         img_idx = 1
         for img in target_images:
             src = img.get_attribute("src")
-            if src and src not in downloaded_urls:
+            if src and "svg" not in src and src not in downloaded_urls:
                 download_image(src, model_cd, img_idx)
                 downloaded_urls.add(src)
                 img_idx += 1
 
-        # 기타 정보
-        ship = page.query_selector(".css-1n3oo4w")
-        res["Shipping_information"] = ship.inner_text().strip() if ship else ""
-        rec = page.query_selector(".css-yfldxx")
-        res["rec_reason"] = rec.inner_text().strip() if rec else ""
+        # 2) rec_reason (파이프 적용 대상)
+        rec_el = page.query_selector(".css-isc2b5 .css-yfldxx")
+        res["rec_reason"] = clean_text_to_pipe(rec_el.inner_text()) if rec_el else ""
 
     except Exception as e:
         print(f"   ⚠️ 파싱 에러: {e}")
@@ -195,9 +219,9 @@ def main():
 
         # 상세 수집
         detail_results = []
-        detail_fields = ["model_sn", "model_cd", "model_name", "model_second_name", "grade_name", "year", "km", "refund", "guarantee", "accident", "inner_car_wash", "insurance", "color_ext", "color_int", "main_option", "Shipping_information", "rec_reason", "tire", "tinting", "car_key", "detail_url", "date_crtr_pnttm", "create_dt"]
+        detail_fields = ["model_sn", "model_cd", "model_name", "model_second_name", "grade_name", "year", "km", "refund", "guarantee", "accident", "inner_car_wash", "insurance", "color_ext", "color_int", "main_option", "delivery_information", "rec_reason", "tire", "tinting", "car_key", "detail_url", "date_crtr_pnttm", "create_dt"]
 
-        max_retries = 2
+        max_retries = 5
         for item in raw_list:
             success = False
             for retry in range(max_retries):
