@@ -18,6 +18,17 @@ def setup_logger():
         logger.addHandler(fh); logger.addHandler(sh)
     return logger
 
+def split_boname_by_last_paren(text):
+    """뒤에서부터 첫 번째 ()를 기준으로 나누어 '앞부분|(괄호내용)' 형태로 반환"""
+    if not text or "(" not in text:
+        return text
+    last_open = text.rfind("(")
+    prefix = text[:last_open].strip()
+    suffix = text[last_open:].strip()  # (23년~현재) 형태
+    if not prefix:
+        return text
+    return f"{prefix}|{suffix}"
+
 def run_reborn_brand_crawler():
     logger = setup_logger()
     result_data = []
@@ -75,7 +86,7 @@ def run_reborn_brand_crawler():
                                 "model_sn": model_sn,
                                 "bmname": bmname,
                                 "boiname": boiname,
-                                "boname": full_boname,
+                                "boname": split_boname_by_last_paren(full_boname),
                                 "date_crtr_pnttm": pnttm,
                                 "create_dt": create_dt
                             })
@@ -86,7 +97,7 @@ def run_reborn_brand_crawler():
                             "model_sn": model_sn,
                             "bmname": bmname,
                             "boiname": boiname,
-                            "boname": boiname,
+                            "boname": split_boname_by_last_paren(boiname),
                             "date_crtr_pnttm": pnttm,
                             "create_dt": create_dt
                         })
