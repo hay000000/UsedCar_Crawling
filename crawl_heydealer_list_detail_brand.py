@@ -8,7 +8,8 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 # --- 설정 및 경로 ---
-TARGET_COUNT = 3
+# [특정 개수만 수집할 때] 아래 주석 해제 후 사용
+TARGET_COUNT = 702
 
 BASE_URL = "https://www.heydealer.com"
 BASE_DIR = Path(__file__).resolve().parent
@@ -16,7 +17,7 @@ BASE_DIR = Path(__file__).resolve().parent
 # 폴더 경로 설정
 RESULT_DIR = BASE_DIR / "result" / "heydealer"
 LOG_DIR = BASE_DIR / "logs" / "heydealer"
-IMG_DIR = BASE_DIR / "image" / "heydealer"
+IMG_DIR = BASE_DIR / "imgs" / "heydealer"
 
 # 폴더 생성
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -153,15 +154,15 @@ def _extract_detail_smart(page, list_item) -> dict:
     
     """
     res = {
-        "model_sn": list_item.get("model_sn", ""),
-        "brand_id": list_item.get("brand_id", ""),
-        "brand_name": list_item.get("brand_name", ""),
-        "model_cd": list_item.get("model_cd", ""),
-        "model_name": list_item.get("model_name", ""),
-        "model_second_name": list_item.get("model_second_name", ""),
-        "grade_name": list_item.get("grade_name", ""),
-        "year": list_item.get("year", ""),
-        "km": list_item.get("km", ""),
+        "model_sn": str(list_item.get("model_sn", "")),
+        "brand_id": str(list_item.get("brand_id", "")),
+        "brand_name": str(list_item.get("brand_name", "")),
+        "model_cd": str(list_item.get("model_cd", "")),
+        "model_name": str(list_item.get("model_name", "")),
+        "model_second_name": str(list_item.get("model_second_name", "")),
+        "grade_name": str(list_item.get("grade_name", "")),
+        "year": str(list_item.get("year", "")),
+        "km": str(list_item.get("km", "")),
         "refund": "", "guarantee": "", "accident": "", 
         "inner_car_wash": "", "insurance": "", "exterior_description": "", "interior_description": "", 
         "options": "", "delivery_information": "", "recommendation_comment": "",
@@ -172,7 +173,13 @@ def _extract_detail_smart(page, list_item) -> dict:
     }
     
     try:
-        page.wait_for_selector(".css-12qft46", timeout=20000)
+        try:
+            page.wait_for_selector(".css-12qft46", timeout=20000)
+        except Exception:
+            try:
+                page.wait_for_selector(".css-113wzqa", timeout=10000)
+            except Exception:
+                pass
         page.wait_for_timeout(2000)
         # 레이지 로딩/SPA 대비: 먼저 스크롤해서 섹션·이미지 로드
         for i in range(1, 14):
@@ -263,17 +270,26 @@ def _extract_detail_smart(page, list_item) -> dict:
                         img_idx += 1
             if img_idx > 1:
                 print(f"      📷 재시도로 {img_idx - 1}개 이미지 수집")
-        print(f"      ✅ 총 {img_idx - 1}개 이미지 다운로드 완료")
+        print(f"      📷 상세 이미지 다운로드 성공: {res['model_cd']} {img_idx - 1}장")
         
         # === 페이지 스크롤 (동적 콘텐츠 로딩) ===
         for i in range(1, 15):
             page.evaluate(f"window.scrollTo(0, {i * 600})")
             time.sleep(0.15)
         
+        # === 스펙 영역 로드 대기 (부분 수집 방지) ===
+        for _ in range(2):
+            try:
+                page.wait_for_selector(".css-113wzqa", timeout=12000)
+                break
+            except Exception:
+                page.wait_for_timeout(2000)
+        page.wait_for_timeout(500)
+
         # === 데이터 수집 로직 ===
         option_elements = page.query_selector_all(".css-5pr39e .css-13wylk3, .css-5pr39e .css-1396o7r")
         if option_elements:
-            res["options"] = ", ".join([opt.inner_text().strip() for opt in option_elements if opt.inner_text().strip()])
+            res["options"] = ", ".join([str(opt.inner_text() or "").strip() for opt in option_elements if str(opt.inner_text() or "").strip()])
 
         containers = page.query_selector_all(".css-1cfq7ri")
         for container in containers:
@@ -287,23 +303,54 @@ def _extract_detail_smart(page, list_item) -> dict:
         if rec_el:
             res["recommendation_comment"] = rec_el.inner_text().replace("\n", " | ").strip()
 
-        items = page.query_selector_all(".css-113wzqa")
-        for item in items:
-            lbl_el = item.query_selector(".css-1b7o1k1")
-            val_el = item.query_selector(".css-1b7o1k1 + div")
-            if lbl_el and val_el:
+        def _fill_spec_from_items(items_selector):
+            filled = 0
+            for item in page.query_selector_all(items_selector):
+                lbl_el = item.query_selector(".css-1b7o1k1")
+                if not lbl_el:
+                    continue
                 lbl = lbl_el.inner_text().replace(" ", "").strip()
-                val = val_el.inner_text().strip()
-                if not val: continue
-                if "연식" in lbl: res["year"] = val
-                elif "주행거리" in lbl: res["km"] = val
-                elif "환불" in lbl: res["refund"] = val
-                elif "헤이딜러보증" in lbl: res["guarantee"] = val
-                elif "사고" in lbl: res["accident"] = val
-                elif "실내세차" in lbl: res["inner_car_wash"] = val
-                elif "자차보험처리" in lbl: res["insurance"] = val
-                elif "외부" in lbl: res["exterior_description"] = val
-                elif "실내" in lbl and "세차" not in lbl: res["interior_description"] = val
+                val_el = item.query_selector(".css-1b7o1k1 + div")
+                if not val_el:
+                    try:
+                        raw = item.evaluate("""node => {
+                            const l = node.querySelector('.css-1b7o1k1');
+                            if (!l) return '';
+                            const n = l.nextElementSibling;
+                            return n ? (n.innerText || n.textContent || '').trim() : '';
+                        }""")
+                        val = str(raw).strip() if raw is not None else ""
+                    except Exception:
+                        val = ""
+                else:
+                    val = str(val_el.inner_text() or "").strip()
+                if not val:
+                    continue
+                if "연식" in lbl and not res["year"]: res["year"] = val; filled += 1
+                elif "주행거리" in lbl and not res["km"]: res["km"] = val; filled += 1
+                elif "환불" in lbl and not res["refund"]: res["refund"] = val; filled += 1
+                elif "헤이딜러보증" in lbl and not res["guarantee"]: res["guarantee"] = val; filled += 1
+                elif "사고" in lbl and not res["accident"]: res["accident"] = val; filled += 1
+                elif "실내세차" in lbl and not res["inner_car_wash"]: res["inner_car_wash"] = val; filled += 1
+                elif "자차보험처리" in lbl and not res["insurance"]: res["insurance"] = val; filled += 1
+                elif "외부" in lbl and not res["exterior_description"]: res["exterior_description"] = val; filled += 1
+                elif "실내" in lbl and "세차" not in lbl and not res["interior_description"]: res["interior_description"] = val; filled += 1
+                elif "타이어" in lbl and not res["tire"]: res["tire"] = val; filled += 1
+                elif "틴팅" in lbl and not res["tinting"]: res["tinting"] = val; filled += 1
+                elif "차키" in lbl and not res["car_key"]: res["car_key"] = val; filled += 1
+            return filled
+
+        _fill_spec_from_items(".css-113wzqa")
+        # 스펙이 비었으면 로딩 지연으로 재대기 후 재추출 (최대 2회)
+        for _ in range(2):
+            if res.get("year") or res.get("km"):
+                break
+            page.wait_for_timeout(3000 if _ == 0 else 5000)
+            for i in range(1, 10):
+                page.evaluate(f"window.scrollTo(0, {i * 400})")
+                time.sleep(0.2)
+            page.wait_for_timeout(1500)
+            _fill_spec_from_items(".css-113wzqa")
         
         # 수집 결과
         filled_fields = sum(1 for k, v in res.items() if v and k not in ["model_sn", "model_cd", "detail_url", "date_crtr_pnttm", "create_dt"])
@@ -332,7 +379,9 @@ def main():
         page = context.new_page()
         page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
+        # [TARGET_COUNT 사용 시] 
         print(f"\n🚀 [1단계] 목록 수집 시작 (목표: {TARGET_COUNT}개)")
+        # print(f"\n🚀 [1단계] 목록 수집 시작 (끝까지 스크롤)")
         list_url = f"{BASE_URL}/market/cars"
         for nav_try in range(3):
             try:
@@ -348,38 +397,59 @@ def main():
         page.wait_for_timeout(3000)
 
         raw_list, seen = [], set()
-        
-        # 무한 스크롤
+        prev_count = 0
+        no_new_rounds = 0
+
+        # 무한 스크롤: 더 이상 새 매물이 안 나올 때까지
         while True:
-            if len(raw_list) >= TARGET_COUNT: 
+            # [TARGET_COUNT 사용 시] 아래 주석 해제
+            if len(raw_list) >= TARGET_COUNT: # TARGET_COUNT 달성 시 종료
                 print(f" ✅ 목표 달성: {TARGET_COUNT}개 수집 완료")
-                break
-            
+                break   # TARGET_COUNT 종료 조건 추가
+
             last_height = page.evaluate("document.body.scrollHeight")
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(2500)
-            
+
             cards = page.query_selector_all('a[href^="/market/cars/"]')
             for card in cards:
-                if len(raw_list) >= TARGET_COUNT:
-                    break
-                    
-                href = card.get_attribute("href").split("?")[0]
-                if href not in seen:
+                # [TARGET_COUNT 사용 시] 아래 주석 해제
+                if len(raw_list) >= TARGET_COUNT: # TARGET_COUNT 달성 시 종료
+                    break   # TARGET_COUNT 종료 조건 추가
+
+                href = (card.get_attribute("href") or "").split("?")[0]
+                if href and href not in seen:
                     seen.add(href)
                     item = _extract_card_heydealer(card, len(raw_list) + 1, brand_map)
                     raw_list.append(item)
                     save_to_csv_append(LIST_FILE, list_fields, item)
-            
-            print(f" 🔄 목록 수집: {len(raw_list)}/{TARGET_COUNT}대")
-            
+
+            # 새로 추가된 매물 없으면 카운트
+            if len(raw_list) == prev_count:
+                no_new_rounds += 1
+            else:
+                no_new_rounds = 0
+            prev_count = len(raw_list)
+
+            # [TARGET_COUNT 사용 시] 아래를 len(raw_list)/TARGET_COUNT 대 로 변경
+            print(f" 🔄 목록 수집: {len(raw_list)}/{TARGET_COUNT}대")   # TARGET_COUNT 추가
+            # print(f" 🔄 목록 수집: {len(raw_list)}대")
+# 
+
             new_height = page.evaluate("document.body.scrollHeight")
             if new_height == last_height:
                 page.wait_for_timeout(2000)
                 if page.evaluate("document.body.scrollHeight") == last_height:
                     print(f"🏁 페이지 끝 도달 (총 {len(raw_list)}대)")
                     break
+            else:
+                no_new_rounds = 0
+            # 더 이상 새 매물이 안 나와도 종료 (스크롤은 되지만 새 카드 없음)
+            if no_new_rounds >= 2:
+                print(f"🏁 새 매물 없음, 수집 종료 (총 {len(raw_list)}대)")
+                break
 
+        print(f"\n📄 목록 CSV 생성 완료: {LIST_FILE} ({len(raw_list)}건)")
         print(f"\n🚀 [2단계] 상세 수집 시작 (총 {len(raw_list)}대)")
         success_count = 0
         
@@ -390,9 +460,22 @@ def main():
                     retry_text = f'재시도({retry})' if retry > 0 else '수집'
                     print(f"\n 🔍 ({idx}/{len(raw_list)}) {retry_text}: {item['model_cd']}")
                     
-                    page.goto(item["detail_url"], wait_until="commit", timeout=40000)
-                    page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    page.goto(item["detail_url"], wait_until="domcontentloaded", timeout=40000)
+                    page.wait_for_load_state("load", timeout=15000)
+                    page.wait_for_timeout(1500)
                     detail = _extract_detail_smart(page, item)
+                    # 스펙이 거의 비었으면 한 번 더 로드 후 재추출 (빈값 행 감소)
+                    spec_keys = ("year", "km", "refund", "guarantee", "accident")
+                    filled_spec = sum(1 for k in spec_keys if str(detail.get(k) or "").strip())
+                    if filled_spec < 2 and retry < 2:
+                        page.wait_for_timeout(3000)
+                        page.goto(item["detail_url"], wait_until="load", timeout=40000)
+                        page.wait_for_timeout(2500)
+                        detail = _extract_detail_smart(page, item)
+                    # 상세 비어 있으면 목록 값으로 채움 (값은 항상 str로)
+                    for k in detail_fields:
+                        if k in item and not str(detail.get(k) or "").strip():
+                            detail[k] = str(item.get(k) or "").strip()
                     save_to_csv_append(DETAIL_FILE, detail_fields, detail)
                     success = True
                     success_count += 1
@@ -403,13 +486,14 @@ def main():
                         time.sleep(2)
             
             if not success:
-                print(f"      ❌ 최종 실패")
-                save_to_csv_append(DETAIL_FILE, detail_fields, {
-                    "model_sn": item["model_sn"],
-                    "model_cd": item["model_cd"],
-                    "detail_url": item["detail_url"]
-                })
+                print(f"      ❌ 최종 실패 (목록 데이터만 저장)")
+                fail_row = {k: str(item.get(k) or "") for k in detail_fields if k in item}
+                for k in detail_fields:
+                    if k not in fail_row:
+                        fail_row[k] = ""
+                save_to_csv_append(DETAIL_FILE, detail_fields, fail_row)
 
+        print(f"\n📄 상세 CSV 생성 완료: {DETAIL_FILE} ({success_count}건)")
         print(f"\n[{datetime.now()}] ✅ 모든 작업 완료!")
         print(f"   - 목록: {len(raw_list)}개")
         print(f"   - 상세 성공: {success_count}/{len(raw_list)}개 ({success_count/len(raw_list)*100:.1f}%)")
