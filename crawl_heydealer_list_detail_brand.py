@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright
 
 # --- 설정 및 경로 ---
 # [특정 개수만 수집할 때] 아래 주석 해제 후 사용
-TARGET_COUNT = 702
+TARGET_COUNT = 10
 
 BASE_URL = "https://www.heydealer.com"
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,8 +29,9 @@ LIST_FILE = RESULT_DIR / "heydealer_list.csv"
 DETAIL_FILE = RESULT_DIR / "heydealer_detail.csv"
 
 # --- 로그 설정 ---
-now_date = datetime.now().strftime("%Y%m%d")
-LOG_FILE = LOG_DIR / f"heydealer_list_detail_log_{now_date}.log"
+# now_date = datetime.now().strftime("%Y%m%d")
+# LOG_FILE = LOG_DIR / f"heydealer_list_detail_log_{now_date}.log"
+LOG_FILE = LOG_DIR / f"heydealer_list_detail.log"
 
 class Logger(object):
     def __init__(self):
