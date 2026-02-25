@@ -304,7 +304,7 @@ def run_full_crawler():
     # TEST_PAGE_LIMIT = 1   # ← 테스트 시 이 줄 주석 해제하고 아래 줄 주석 처리
     TEST_PAGE_LIMIT = None  # ← 전체 수집 시 유지, 테스트 시 위 줄 사용
 
-    result_dir = Path("/home/limhayoung/used_car_crawler/result/reborncar")
+    result_dir = Path(__file__).resolve().parent / "result" / "reborncar"
     result_dir.mkdir(parents=True, exist_ok=True)
     list_path = result_dir / "reborncar_list.csv"
     detail_path = result_dir / "reborncar_detail.csv"
