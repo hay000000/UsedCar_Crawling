@@ -17,22 +17,67 @@ def setup_logger():
         sh = logging.StreamHandler(); logger.addHandler(sh)
     return logger
 
+def load_brand_model_map(result_dir):
+    """reborncar_brand.csv에서 model_list(| 앞부분) -> brand_list 매핑 로드. 동일 경로 사용."""
+    brand_path = result_dir / "reborncar_brand.csv"
+    model_to_brand = {}
+    if not brand_path.exists():
+        return model_to_brand
+    try:
+        with open(brand_path, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                model_list_raw = (row.get("model_list") or "").strip()
+                brand_list = (row.get("brand_list") or "").strip()
+                if not brand_list:
+                    continue
+                # model_list에서 | 앞부분만 키로 사용 (e.g. '올 뉴K3|(18~21년)' -> '올 뉴K3')
+                model_key = model_list_raw.split("|")[0].strip() if model_list_raw else ""
+                if model_key and model_key not in model_to_brand:
+                    model_to_brand[model_key] = brand_list
+    except Exception:
+        pass
+    return model_to_brand
+
+def get_brand_for_lp_car_name(lp_car_name, model_to_brand):
+    """lp_car_name과 brand의 model_list(| 앞) 매칭. 실패 시 lp_car_name 뒤에서 띄어쓰기 기준 마지막 부분으로 재매칭."""
+    name = (lp_car_name or "").strip()
+    if not name:
+        return "-"
+    if name in model_to_brand:
+        return model_to_brand[name]
+    # 매칭 안 됨: 뒤에서부터 띄어쓰기 한 부분만 사용 (e.g. '아우디 A4(5세대)' -> 'A4(5세대)')
+    parts = name.rsplit(maxsplit=1)
+    if len(parts) >= 2:
+        last_part = parts[-1].strip()
+        if last_part in model_to_brand:
+            return model_to_brand[last_part]
+    return "-"
+
 def get_detail_info(page, product_id, logger):
     """상세 페이지에서 추가 데이터를 추출하는 함수"""
     detail_url = f"https://www.reborncar.co.kr/smartbuy/SB1002.rb?productId={product_id}"
     detail_data = {
-        "car_new_price": "-", "accident": "-", "flood": "-", "change_use": "-",
-        "comp_new_car": "-", "smell_level": "-", "refund": "-", "options": "-", "additional_options": "-",
+        "info_list_1": "-", "aci_gbn": "-", "info_tit_1": "-", "special_carhistory": "-",
+        "relamt_per-parent": "-", "smell_grade": "-", "info_tit_2": "-", "option_list": "-", "add_option_list": "-",
         "car_number": "-", "gear_box": "-", "car_color": "-", "car_fuel": "-", "plan_pay": "-",
         "figure_panel": "-", "figure_frame": "-",
         "aqi_list": "-", "aqi_notice_list": "-",
         "tire_summery_front_left": "-", "tire_summery_back_left": "-",
-        "tire_summery_back_right": "-", "tire_summery_front_right": "-"
+        "tire_summery_back_right": "-", "tire_summery_front_right": "-",
+        "bettery_info": "-",
+        "brand_surety_con_1": "-", "brand_surety_con_2": "-"
     }
 
     try:
         page.goto(detail_url, wait_until="domcontentloaded")
         page.wait_for_selector("#info", timeout=10000)
+        # 동적 영역 로딩 대기 (vip-body·aqi 섹션) — 빈값 방지
+        try:
+            page.wait_for_selector(".vip-body .vip-con", state="visible", timeout=8000)
+        except Exception:
+            pass
+        page.wait_for_timeout(800)
 
         # 0. vip-section: 차량번호, 변속기, 색상, 연료, 플랜결제
         vip = page.locator(".vip-section .vip-head .vip-head-info")
@@ -43,7 +88,9 @@ def get_detail_info(page, product_id, logger):
                 first_car = car_infos.nth(0)
                 cn_el = first_car.locator(".car-main-info .car-number")
                 if cn_el.count() > 0:
-                    detail_data["car_number"] = cn_el.inner_text().strip()
+                    v = cn_el.inner_text().strip()
+                    if v:
+                        detail_data["car_number"] = v
             # gear_box, car_color, car_fuel: 두 번째 .car-info > .car-sub-info > .car-infos
             if car_infos.count() >= 2:
                 sub_info = car_infos.nth(1).locator(".car-sub-info .car-infos")
@@ -51,9 +98,15 @@ def get_detail_info(page, product_id, logger):
                     gb = sub_info.locator(".gear-box")
                     cc = sub_info.locator(".car-color")
                     cf = sub_info.locator(".car-fuel")
-                    if gb.count() > 0: detail_data["gear_box"] = gb.inner_text().strip()
-                    if cc.count() > 0: detail_data["car_color"] = cc.inner_text().strip()
-                    if cf.count() > 0: detail_data["car_fuel"] = cf.inner_text().strip()
+                    if gb.count() > 0:
+                        v = gb.inner_text().strip()
+                        if v: detail_data["gear_box"] = v
+                    if cc.count() > 0:
+                        v = cc.inner_text().strip()
+                        if v: detail_data["car_color"] = v
+                    if cf.count() > 0:
+                        v = cf.inner_text().strip()
+                        if v: detail_data["car_fuel"] = v
             # plan_pay: 두 번째 .car-info > .car-sub-pay > .plan-pay
             if car_infos.count() >= 2:
                 plan_ul = car_infos.nth(1).locator(".car-sub-pay .plan-pay")
@@ -66,12 +119,13 @@ def get_detail_info(page, product_id, logger):
                         if txt:
                             txt_flat = re.sub(r"\s+", "", txt)
                             parts.append(re.sub(r"(\d)(만원)", r"\1\2", re.sub(r"^([^\d]+)(\d)", r"\1 : \2", txt_flat)) if re.search(r"\d", txt_flat) else txt_flat)
-                    detail_data["plan_pay"] = " | ".join(parts) if parts else "-"
+                    if parts:
+                        detail_data["plan_pay"] = " | ".join(parts)
 
         # 1. 신차 출고가 추출
         price_el = page.locator("li:has-text('신차 출고가') .car-new-price")
         if price_el.count() > 0:
-            detail_data["car_new_price"] = price_el.inner_text().strip()
+            detail_data["info_list_1"] = price_el.inner_text().strip()
 
         # 2. 사고/침수/용도/가격대비/냄새/환불 추출 (요소 없으면 5초 후 스킵)
         t_detail = 5000
@@ -81,18 +135,21 @@ def get_detail_info(page, product_id, logger):
                 con = info_list.nth(i)
                 title = con.locator(".info-txt").inner_text(timeout=t_detail).replace(">", "").strip()
                 value = con.locator(".info-tit").inner_text(timeout=t_detail).strip()
-                if "사고여부" in title: detail_data["accident"] = value
-                elif "침수여부" in title: detail_data["flood"] = value
-                elif "용도변경" in title: detail_data["change_use"] = value
-                elif "신차가격대비" in title: detail_data["comp_new_car"] = re.sub(r"\s+", "", value)
-                elif "냄새등급" in title: detail_data["smell_level"] = value
-                elif "안심환불" in title: detail_data["refund"] = value
+                if value:
+                    if "사고여부" in title: detail_data["aci_gbn"] = value
+                    elif "침수여부" in title: detail_data["info_tit_1"] = value
+                    elif "용도변경" in title: detail_data["special_carhistory"] = value
+                    elif "신차가격대비" in title: detail_data["relamt_per-parent"] = re.sub(r"\s+", "", value)
+                    elif "냄새등급" in title: detail_data["smell_grade"] = value
+                    elif "안심환불" in title: detail_data["info_tit_2"] = value
             except Exception:
                 continue
 
         # 3. 차량 옵션 추출 (기본) - 구분자 |
         options = page.locator(".vip-option-list .vip-option-txt").all_inner_texts()
-        detail_data["options"] = " | ".join([o.strip() for o in options if o.strip()])
+        opt_str = " | ".join([o.strip() for o in options if o.strip()])
+        if opt_str:
+            detail_data["option_list"] = opt_str
 
         # 4. 추가 선택 옵션 추출 - 구분자 |
         add_opt_list = page.locator(".add-option-list .add-option-con")
@@ -101,7 +158,9 @@ def get_detail_info(page, product_id, logger):
             opt_title = add_opt_list.nth(i).locator(".add-option-title").inner_text().strip()
             opt_pay = add_opt_list.nth(i).locator(".add-option-pay").inner_text().strip()
             add_opts.append(f"{opt_title}({opt_pay})")
-        detail_data["additional_options"] = " | ".join(add_opts)
+        add_opt_str = " | ".join(add_opts)
+        if add_opt_str:
+            detail_data["add_option_list"] = add_opt_str
 
         # 5. vip-body: figure_panel(.cont.sheeting-status), figure_frame(.cont.change-status)
         body = page.locator(".vip-body .vip-con .con-section.aqi .vip-cont .car-figure-form .car-figure-info .car-figure-info-list")
@@ -126,7 +185,9 @@ def get_detail_info(page, product_id, logger):
             # figure_frame: .figure-frame .cont.change-status 텍스트
             frame_el = body.locator(".figure-frame .cont.change-status")
             if frame_el.count() > 0:
-                detail_data["figure_frame"] = frame_el.inner_text().strip() or "-"
+                v = frame_el.inner_text().strip()
+                if v:
+                    detail_data["figure_frame"] = v
 
         # 6. 두 번째 .vip-cont: aqi_list, aqi_notice_list, tire_summery
         second_cont = page.locator(".vip-body .vip-con .con-section.aqi .vip-cont").nth(1)
@@ -180,6 +241,54 @@ def get_detail_info(page, product_id, logger):
                 if bl.count() > 0: detail_data["tire_summery_back_left"] = _tire_parts(bl)
                 if br.count() > 0: detail_data["tire_summery_back_right"] = _tire_parts(br)
                 if fr.count() > 0: detail_data["tire_summery_front_right"] = _tire_parts(fr)
+            # bettery_info: .aqi-another-form .aqi-another-box .aqi-another-con .aqi-battey .cont.bettey-exist → .bettery-info .battey-count + .bettey-comment
+            bettey_exist = second_cont.locator(".aqi-another-form .aqi-another-box .aqi-another-con .aqi-battey .cont.bettey-exist")
+            if bettey_exist.count() > 0:
+                try:
+                    count_el = bettey_exist.locator(".bettery-info .battey-count")
+                    comment_el = bettey_exist.locator(".bettey-comment")
+                    count_txt = count_el.inner_text().strip() if count_el.count() > 0 else ""
+                    comment_txt = comment_el.inner_text().strip() if comment_el.count() > 0 else ""
+                    if count_txt or comment_txt:
+                        detail_data["bettery_info"] = f"{count_txt} | {comment_txt}".strip(" | ")
+                except Exception:
+                    pass
+
+        # 7. 네 번째 .vip-cont: brand_surety_form → brand_surety_con_1, brand_surety_con_2
+        fourth_cont = page.locator(".vip-body .vip-con .con-section.aqi .vip-cont").nth(3)
+        if fourth_cont.count() > 0:
+            brand_surety_cons = fourth_cont.locator(".brand-surety-form .brand-surety-new .brand-surety-con")
+            for idx in range(min(2, brand_surety_cons.count())):
+                key = f"brand_surety_con_{idx + 1}"
+                parts = []
+                try:
+                    con = brand_surety_cons.nth(idx)
+                    surety_list = con.locator(".surety-list-con .surety-con")
+                    for i in range(surety_list.count()):
+                        sc = surety_list.nth(i)
+                        label_el = sc.locator(".surety-con-head .txt")
+                        cont_txt_el = sc.locator(".surety-con-head .cont-txt")
+                        if label_el.count() == 0 or cont_txt_el.count() == 0:
+                            continue
+                        label = label_el.inner_text().strip()
+                        cont_txt = cont_txt_el.inner_text().strip()
+                        if "보증 기간" in label:
+                            if "보증 만료" in cont_txt:
+                                parts.append("보증 기간 : 보증 만료")
+                            else:
+                                parts.append(f"보증 기간 : {cont_txt}")
+                        elif "주행" in label:
+                            parts.append(f"주행 거리 : {cont_txt}")
+                    if parts:
+                        detail_data[key] = " | ".join(parts)
+                except Exception:
+                    pass
+
+        # 빈값 정규화: CSV에 빈 셀 대신 "-" 저장
+        for k in detail_data:
+            val = detail_data[k]
+            if val is None or (isinstance(val, str) and not val.strip()):
+                detail_data[k] = "-"
 
     except Exception as e:
         logger.error(f"상세 페이지 추출 에러 ({product_id}): {e}")
@@ -192,8 +301,8 @@ def run_full_crawler():
     pnttm, create_dt_full = now.strftime("%Y%m%d"), now.strftime("%Y%m%d%H%M")
     
     # [테스트] 목록·상세 모두 N페이지까지만 수집 (전체 수집 시 None 유지)
-    TEST_PAGE_LIMIT = 1   # ← 테스트 시 이 줄 주석 해제하고 아래 줄 주석 처리
-    # TEST_PAGE_LIMIT = None  # ← 전체 수집 시 유지, 테스트 시 위 줄 사용
+    # TEST_PAGE_LIMIT = 1   # ← 테스트 시 이 줄 주석 해제하고 아래 줄 주석 처리
+    TEST_PAGE_LIMIT = None  # ← 전체 수집 시 유지, 테스트 시 위 줄 사용
 
     result_dir = Path("/home/limhayoung/used_car_crawler/result/reborncar")
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -203,16 +312,18 @@ def run_full_crawler():
     if detail_path.exists(): detail_path.unlink()
 
     list_headers = [
-        "model_sn", "productId", "car_type", "boname", "gradename", "year", "carnavi", "car_seat",
+        "model_sn", "productid", "car_type_name", "brand_list", "lp_car_name",  "lp_car_trim", "release_dt", "car_navi", "car_seat",
         "car_main_pay", "amtsel", "status", "copytext", "endtimedeal", "date_crtr_pnttm", "create_dt"
     ]
+    brand_model_map = load_brand_model_map(result_dir)
     detail_headers = [
-        "model_sn", "productId", "car_number", "gear_box", "car_color", "car_fuel", "plan_pay",
-        "car_new_price", "accident", "flood", "change_use", "comp_new_car",
-        "smell_level", "refund", "options", "additional_options",
+        "model_sn", "productid", "car_number", "gear_box", "car_color", "car_fuel", "plan_pay",
+        "info_list_1", "aci_gbn", "info_tit_1", "special_carhistory", "relamt_per-parent",
+        "smell_grade", "info_tit_2", "option_list", "add_option_list",
         "figure_panel", "figure_frame",
         "aqi_list", "aqi_notice_list",
         "tire_summery_front_left", "tire_summery_back_left", "tire_summery_back_right", "tire_summery_front_right",
+        "bettery_info", "brand_surety_con_1", "brand_surety_con_2",
         "date_crtr_pnttm", "create_dt"
     ]
 
@@ -249,9 +360,13 @@ def run_full_crawler():
                 current_car_type = car_type_labels[car_type_idx]
                 if n_car_types > 1:
                     try:
+                        # 차종 버튼 클릭 → lp-filter-list 안에 lp-filter-choice(span[data-cls="cate-cb"]) 칩 생성
                         car_type_buttons.nth(car_type_idx).click()
                         page.wait_for_timeout(2500)
-                        logger.info(f"차종 필터 선택: {current_car_type}")
+                        # 해당 차종 칩이 생겼는지 확인 (data-cls="cate-cb" 텍스트가 현재 차종명)
+                        page.wait_for_selector('.lp-filter-list .lp-filter-choice span[data-cls="cate-cb"]', timeout=8000)
+                        page.wait_for_timeout(800)
+                        logger.info(f"차종 필터 선택 (칩 생성): {current_car_type}")
                     except Exception as e:
                         logger.warning(f"차종 필터 클릭 실패 ({current_car_type}): {e}")
                         continue
@@ -303,12 +418,14 @@ def run_full_crawler():
                             v_copy = "타임딜" if is_td else ""
                             v_endtd = item.locator(".lp-timedeal-count").inner_text().strip() if is_td else ""
 
-                            # list.csv 행 (목록 데이터만, car_type=현재 차종 필터)
+                            # list.csv 행 (목록 데이터만, car_type=현재 차종 필터, brand_list=brand 파일 매칭)
+                            v_lp_car_name = item.locator(".lp-car-name").inner_text().strip()
                             list_row = {
-                                "model_sn": car_counter, "productId": v_product_id, "car_type": current_car_type,
-                                "boname": item.locator(".lp-car-name").inner_text().strip(),
-                                "gradename": item.locator(".lp-car-trim").inner_text().strip(),
-                                "year": v_year, "carnavi": v_navi, "car_seat": v_seat,
+                                "model_sn": car_counter, "productid": v_product_id, "car_type_name": current_car_type,
+                                "lp_car_name": v_lp_car_name,
+                                "brand_list": get_brand_for_lp_car_name(v_lp_car_name, brand_model_map),
+                                "lp_car_trim": item.locator(".lp-car-trim").inner_text().strip(),
+                                "release_dt": v_year, "car_navi": v_navi, "car_seat": v_seat,
                                 "car_main_pay": v_finamt, "amtsel": v_amtsel, "status": v_status,
                                 "copytext": v_copy, "endtimedeal": v_endtd,
                                 "date_crtr_pnttm": pnttm, "create_dt": create_dt_full
@@ -322,8 +439,8 @@ def run_full_crawler():
                             # detail.csv 행 (상세 데이터, 준비중/판매완료 제외 시에만 수집)
                             if v_product_id and v_status not in ["준비중", "판매완료"]:
                                 v_details = get_detail_info(detail_page, v_product_id, logger)
-                                detail_row = {"model_sn": car_counter, "productId": v_product_id}
-                                detail_row.update({k: v_details.get(k, "-") for k in detail_headers if k not in ("model_sn", "productId")})
+                                detail_row = {"model_sn": car_counter, "productid": v_product_id}
+                                detail_row.update({k: v_details.get(k, "-") for k in detail_headers if k not in ("model_sn", "productid")})
                                 detail_row["date_crtr_pnttm"] = pnttm
                                 detail_row["create_dt"] = create_dt_full
                                 with open(detail_path, "a", newline="", encoding="utf-8-sig") as fd:
@@ -333,10 +450,10 @@ def run_full_crawler():
                                     wd.writerow(detail_row)
                                 detail_count_this_page += 1
                             else:
-                                # 상세 미수집 시에도 productId/model_sn만 있는 행 추가 (조인용)
+                                # 상세 미수집 시에도 productid/model_sn만 있는 행 추가 (조인용)
                                 detail_row = {k: "-" for k in detail_headers}
                                 detail_row["model_sn"] = car_counter
-                                detail_row["productId"] = v_product_id
+                                detail_row["productid"] = v_product_id
                                 detail_row["date_crtr_pnttm"] = pnttm
                                 detail_row["create_dt"] = create_dt_full
                                 with open(detail_path, "a", newline="", encoding="utf-8-sig") as fd:
@@ -370,13 +487,28 @@ def run_full_crawler():
                         else:
                             break
                     page.wait_for_timeout(1500)
+                    # 다음 페이지로 넘어갔는지 확인; 그대로면 마지막 페이지라서 종료 (중복 수집 방지)
                     try:
                         new_active = page.locator("li.pagination-con.page-num.active")
                         new_page = int(new_active.inner_text() or "0")
                         if new_page == prev_page:
-                            page.wait_for_timeout(3000)
+                            page.wait_for_timeout(1500)
+                            break
                     except Exception:
-                        pass
+                        break
+
+                # 현재 차종 수집이 끝났으면, lp-filter-choice-delete로 해당 칩 제거 후 다음 차종 선택 준비
+                if n_car_types > 1:
+                    try:
+                        choice_delete = page.locator(
+                            '.lp-filter-list .lp-filter-choice:has(span[data-cls="cate-cb"])'
+                        ).filter(has_text=current_car_type).locator(".lp-filter-choice-delete").first
+                        if choice_delete.count() > 0:
+                            choice_delete.click()
+                            page.wait_for_timeout(2000)
+                            logger.info(f"차종 필터 칩 제거: {current_car_type}")
+                    except Exception as e:
+                        logger.warning(f"차종 칩 제거 실패 ({current_car_type}): {e}")
 
         finally:
             browser.close()

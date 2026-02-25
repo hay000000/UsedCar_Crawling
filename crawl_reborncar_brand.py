@@ -58,9 +58,9 @@ def run_reborn_brand_crawler():
 
             for i in range(brand_count):
                 brand_box = brand_selectors.nth(i)
-                bmname = brand_box.locator(".brand-name label span").inner_text().strip()
+                brand_list = brand_box.locator(".brand-name label span").inner_text().strip()
                 
-                logger.info(f"[{bmname}] 처리 중...")
+                logger.info(f"[{brand_list}] 처리 중...")
                 brand_box.locator(".brand-name label").click()
                 page.wait_for_timeout(400)
 
@@ -69,7 +69,7 @@ def run_reborn_brand_crawler():
 
                 for j in range(car_count):
                     car_box = car_items.nth(j)
-                    boiname = car_box.locator("label span").first.inner_text().strip()
+                    car_list = car_box.locator("label span").first.inner_text().strip()
                     
                     # 차종 클릭하여 상세 모델 활성화
                     car_box.locator("label").first.click()
@@ -84,9 +84,9 @@ def run_reborn_brand_crawler():
                             
                             result_data.append({
                                 "model_sn": model_sn,
-                                "bmname": bmname,
-                                "boiname": boiname,
-                                "boname": split_boname_by_last_paren(full_boname),
+                                "brand_list": brand_list,
+                                "car_list": car_list,
+                                "model_list": split_boname_by_last_paren(full_boname),
                                 "date_crtr_pnttm": pnttm,
                                 "create_dt": create_dt
                             })
@@ -95,9 +95,9 @@ def run_reborn_brand_crawler():
                         # 상세 모델이 없는 경우
                         result_data.append({
                             "model_sn": model_sn,
-                            "bmname": bmname,
-                            "boiname": boiname,
-                            "boname": split_boname_by_last_paren(boiname),
+                            "brand_list": brand_list,
+                            "car_list": car_list,
+                            "model_list": split_boname_by_last_paren(car_list),
                             "date_crtr_pnttm": pnttm,
                             "create_dt": create_dt
                         })
@@ -105,7 +105,7 @@ def run_reborn_brand_crawler():
 
             # CSV 저장 (요청하신 순서대로 헤더 설정)
             if result_data:
-                headers = ["model_sn", "bmname", "boiname", "boname", "date_crtr_pnttm", "create_dt"]
+                headers = ["model_sn", "brand_list", "car_list", "model_list", "date_crtr_pnttm", "create_dt"]
                 with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
                     writer = csv.DictWriter(f, fieldnames=headers)
                     writer.writeheader()

@@ -27,8 +27,8 @@ def save_to_csv(data):
     result_path = result_dir / "reborncar_car_type_list.csv"
     result_dir.mkdir(parents=True, exist_ok=True)
     
-    # 변경된 컬럼명 설정 (순번, bgno, bgname)
-    keys = ["car_type_sn", "bgno", "bgname"]
+    # 변경된 컬럼명 설정 (순번, cate_cb, car_type_name)
+    keys = ["car_type_sn", "cate_cb", "car_type_name"]
     with open(result_path, "w", newline="", encoding="utf-8-sig") as f:
         dict_writer = csv.DictWriter(f, fieldnames=keys)
         dict_writer.writeheader()
@@ -57,22 +57,22 @@ def run_crawler():
 
             for el in car_type_elements:
                 el_id = el.get_attribute("id")
-                # value 값을 bgno로 사용
-                bgno = el.get_attribute("value")
+                # value 값을 cate_cb 사용
+                cate_cb = el.get_attribute("value")
                 
-                # input의 id와 연결된 label 안의 span 텍스트를 bgname으로 사용
+                # input의 id와 연결된 label 안의 span 텍스트를 car_type_name 사용
                 label_span = page.locator(f"label[for='{el_id}'] span")
                 
                 if label_span.count() > 0:
-                    bgname = label_span.inner_text().strip()
+                    car_type_name = label_span.inner_text().strip()
                     
                     item = {
                         "car_type_sn": car_type_sn,
-                        "bgno": bgno,
-                        "bgname": bgname
+                        "cate_cb": cate_cb,
+                        "car_type_name": car_type_name
                     }
                     results.append(item)
-                    logger.info(f"[수집 성공] {bgname} (SN: {car_type_sn}, bgno: {bgno})")
+                    logger.info(f"[수집 성공] {car_type_name} (SN: {car_type_sn}, cate_cb: {cate_cb})")
                     
                     car_type_sn += 1  # 순번 증가
 
