@@ -3,6 +3,7 @@ import logging
 import re
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
 def setup_logger():
@@ -18,44 +19,98 @@ def setup_logger():
     return logger
 
 def load_brand_model_map(result_dir):
-    """reborncar_brand.csv에서 model_list(| 앞부분) -> brand_list 매핑 로드. 동일 경로 사용."""
-    brand_path = result_dir / "reborncar_brand.csv"
+    """reborncar_brand_list.csv에서 model_list(| 앞부분) -> brand_list, car_list 매핑 로드. 동일 경로 사용."""
+    brand_path = result_dir / "reborncar_brand_list.csv"
     model_to_brand = {}
+    model_to_car_list = {}
     if not brand_path.exists():
-        return model_to_brand
+        return model_to_brand, model_to_car_list
     try:
         with open(brand_path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 model_list_raw = (row.get("model_list") or "").strip()
                 brand_list = (row.get("brand_list") or "").strip()
+                car_list = (row.get("car_list") or "").strip()
                 if not brand_list:
                     continue
                 # model_list에서 | 앞부분만 키로 사용 (e.g. '올 뉴K3|(18~21년)' -> '올 뉴K3')
                 model_key = model_list_raw.split("|")[0].strip() if model_list_raw else ""
                 if model_key and model_key not in model_to_brand:
                     model_to_brand[model_key] = brand_list
+                    model_to_car_list[model_key] = car_list if car_list else "-"
     except Exception:
         pass
-    return model_to_brand
+    return model_to_brand, model_to_car_list
 
-def get_brand_for_lp_car_name(lp_car_name, model_to_brand):
-    """lp_car_name과 brand의 model_list(| 앞) 매칭. 실패 시 lp_car_name 뒤에서 띄어쓰기 기준 마지막 부분으로 재매칭."""
+def _get_model_key_for_lp_car_name(lp_car_name, model_keys):
+    """lp_car_name으로 model_keys 중 매칭되는 키 반환. 없으면 None."""
     name = (lp_car_name or "").strip()
-    if not name:
-        return "-"
-    if name in model_to_brand:
-        return model_to_brand[name]
-    # 매칭 안 됨: 뒤에서부터 띄어쓰기 한 부분만 사용 (e.g. '아우디 A4(5세대)' -> 'A4(5세대)')
+    if not name or not model_keys:
+        return None
+    if name in model_keys:
+        return name
     parts = name.rsplit(maxsplit=1)
     if len(parts) >= 2:
         last_part = parts[-1].strip()
-        if last_part in model_to_brand:
-            return model_to_brand[last_part]
-    return "-"
+        if last_part in model_keys:
+            return last_part
+    return None
 
-def get_detail_info(page, product_id, logger):
-    """상세 페이지에서 추가 데이터를 추출하는 함수"""
+def get_brand_for_lp_car_name(lp_car_name, model_to_brand):
+    """lp_car_name과 brand의 model_list(| 앞) 매칭. 실패 시 lp_car_name 뒤에서 띄어쓰기 기준 마지막 부분으로 재매칭."""
+    key = _get_model_key_for_lp_car_name(lp_car_name, model_to_brand)
+    return model_to_brand[key] if key else "-"
+
+def get_car_list_for_lp_car_name(lp_car_name, model_to_car_list):
+    """lp_car_name으로 brand의 model_list(| 앞) 매칭 후 해당 car_list 반환."""
+    key = _get_model_key_for_lp_car_name(lp_car_name, model_to_car_list)
+    return model_to_car_list.get(key, "-") if key else "-"
+
+def save_detail_images(page, product_id, save_dir, detail_url, logger):
+    """상세 페이지 vip-visual 영역 이미지를 product_id_1.png, product_id_2.png ... 로 저장."""
+    if not product_id or not save_dir:
+        return
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    base_url = detail_url.rsplit("?", 1)[0] if "?" in detail_url else detail_url
+    urls = []
+    # 1) #wrap .vip-section .vip-visual .vip-visual-detail .visual-detail .detail-img 내 이미지
+    detail_imgs = page.locator("#wrap .vip-section .vip-visual .vip-visual-detail .visual-detail .detail-img img")
+    for i in range(detail_imgs.count()):
+        src = detail_imgs.nth(i).get_attribute("src")
+        if src:
+            urls.append(src)
+    if not urls:
+        single = page.locator("#wrap .vip-section .vip-visual .vip-visual-detail .visual-detail img.detail-img").first
+        if single.count() > 0:
+            src = single.get_attribute("src")
+            if src:
+                urls.append(src)
+    # 2) .vip-visual-list .visual-box .visual-con 내 이미지
+    list_imgs = page.locator("#wrap .vip-section .vip-visual .vip-visual-list .visual-box .visual-con img")
+    for i in range(list_imgs.count()):
+        src = list_imgs.nth(i).get_attribute("src")
+        if src:
+            urls.append(src)
+    saved_count = 0
+    for idx, src in enumerate(urls, start=1):
+        try:
+            full_url = urljoin(base_url, src) if not (src.startswith("http") or src.startswith("//")) else ("https:" + src if src.startswith("//") else src)
+            resp = page.request.get(full_url)
+            if resp.ok:
+                path = save_dir / f"{product_id}_{idx}.png"
+                path.write_bytes(resp.body())
+                # logger.info(f"이미지 저장: {path}")
+                saved_count += 1
+        except Exception as e:
+            logger.warning(f"이미지 저장 실패 ({product_id}_{idx}): {e}")
+    if saved_count > 0:
+        # 이미지 저장된거 log로 출력
+        logger.info(f"{product_id} 이미지 수집 완료")
+
+def get_detail_info(page, product_id, logger, img_save_dir=None):
+    """상세 페이지에서 추가 데이터를 추출하는 함수. img_save_dir이 있으면 vip-visual 이미지 저장."""
     detail_url = f"https://www.reborncar.co.kr/smartbuy/SB1002.rb?productId={product_id}"
     detail_data = {
         "info_list_1": "-", "aci_gbn": "-", "info_tit_1": "-", "special_carhistory": "-",
@@ -290,6 +345,14 @@ def get_detail_info(page, product_id, logger):
             if val is None or (isinstance(val, str) and not val.strip()):
                 detail_data[k] = "-"
 
+        # vip-visual 이미지 저장 (detail-img, visual-con)
+        if img_save_dir:
+            try:
+                page.wait_for_selector(".vip-section .vip-visual", state="visible", timeout=5000)
+                save_detail_images(page, product_id, img_save_dir, detail_url, logger)
+            except Exception as img_e:
+                logger.warning(f"이미지 저장 스킵 ({product_id}): {img_e}")
+
     except Exception as e:
         logger.error(f"상세 페이지 추출 에러 ({product_id}): {e}")
     
@@ -300,24 +363,27 @@ def run_full_crawler():
     now = datetime.now()
     pnttm, create_dt_full = now.strftime("%Y%m%d"), now.strftime("%Y%m%d%H%M")
     
-    # [테스트] 목록·상세 모두 N페이지까지만 수집 (전체 수집 시 None 유지)
-    # TEST_PAGE_LIMIT = 1   # ← 테스트 시 이 줄 주석 해제하고 아래 줄 주석 처리
-    TEST_PAGE_LIMIT = None  # ← 전체 수집 시 유지, 테스트 시 위 줄 사용
-
-    result_dir = Path(__file__).resolve().parent / "result" / "reborncar"
+    # [테스트] 목록·상세 N페이지까지만 수집 (전체 수집 시 None 유지)
+    TEST_PAGE_LIMIT = 1   # ← 테스트 시 이 줄 주석 해제하고 아래 줄 주석 처리
+    # TEST_PAGE_LIMIT = None  # ← 전체 수집 시 유지, 테스트 시 위 줄 사용
+    # result/reborncar (프로젝트 루트 기준): list.csv, detail.csv
+    result_dir = Path(__file__).resolve().parent.parent / "result" / "reborncar"
     result_dir.mkdir(parents=True, exist_ok=True)
+    # 이미지 저장: imgs/reborncar/2026년/20260226 형태 (오늘 날짜)
+    img_save_dir = Path(__file__).resolve().parent.parent / "imgs" / "reborncar" / f"{now.year}년" / now.strftime("%Y%m%d")
+    img_save_dir.mkdir(parents=True, exist_ok=True)
     list_path = result_dir / "reborncar_list.csv"
     detail_path = result_dir / "reborncar_detail.csv"
     if list_path.exists(): list_path.unlink()
     if detail_path.exists(): detail_path.unlink()
 
     list_headers = [
-        "model_sn", "productid", "car_type_name", "brand_list", "lp_car_name",  "lp_car_trim", "release_dt", "car_navi", "car_seat",
+        "model_sn", "product_id", "car_type_name", "brand_list", "car_list", "lp_car_name",  "lp_car_trim", "release_dt", "car_navi", "car_seat",
         "car_main_pay", "amtsel", "status", "copytext", "endtimedeal", "date_crtr_pnttm", "create_dt"
     ]
-    brand_model_map = load_brand_model_map(result_dir)
+    brand_model_map, model_to_car_list = load_brand_model_map(result_dir)
     detail_headers = [
-        "model_sn", "productid", "car_number", "gear_box", "car_color", "car_fuel", "plan_pay",
+        "model_sn", "product_id", "car_number", "gear_box", "car_color", "car_fuel", "plan_pay",
         "info_list_1", "aci_gbn", "info_tit_1", "special_carhistory", "relamt_per-parent",
         "smell_grade", "info_tit_2", "option_list", "add_option_list",
         "figure_panel", "figure_frame",
@@ -421,9 +487,10 @@ def run_full_crawler():
                             # list.csv 행 (목록 데이터만, car_type=현재 차종 필터, brand_list=brand 파일 매칭)
                             v_lp_car_name = item.locator(".lp-car-name").inner_text().strip()
                             list_row = {
-                                "model_sn": car_counter, "productid": v_product_id, "car_type_name": current_car_type,
+                                "model_sn": car_counter, "product_id": v_product_id, "car_type_name": current_car_type,
                                 "lp_car_name": v_lp_car_name,
                                 "brand_list": get_brand_for_lp_car_name(v_lp_car_name, brand_model_map),
+                                "car_list": get_car_list_for_lp_car_name(v_lp_car_name, model_to_car_list),
                                 "lp_car_trim": item.locator(".lp-car-trim").inner_text().strip(),
                                 "release_dt": v_year, "car_navi": v_navi, "car_seat": v_seat,
                                 "car_main_pay": v_finamt, "amtsel": v_amtsel, "status": v_status,
@@ -436,31 +503,39 @@ def run_full_crawler():
                                     wl.writeheader()
                                 wl.writerow(list_row)
 
-                            # detail.csv 행 (상세 데이터, 준비중/판매완료 제외 시에만 수집)
-                            if v_product_id and v_status not in ["준비중", "판매완료"]:
-                                v_details = get_detail_info(detail_page, v_product_id, logger)
-                                detail_row = {"model_sn": car_counter, "productid": v_product_id}
-                                detail_row.update({k: v_details.get(k, "-") for k in detail_headers if k not in ("model_sn", "productid")})
-                                detail_row["date_crtr_pnttm"] = pnttm
-                                detail_row["create_dt"] = create_dt_full
+                            # detail.csv 행 (상세 데이터, 준비중/판매완료 제외 시에만 수집; 실패 시에도 빈 행 1건 반드시 기록해 list/detail 행 수 일치)
+                            def write_detail_row(detail_row_dict):
                                 with open(detail_path, "a", newline="", encoding="utf-8-sig") as fd:
                                     wd = csv.DictWriter(fd, fieldnames=detail_headers)
                                     if car_counter == 1:
                                         wd.writeheader()
-                                    wd.writerow(detail_row)
-                                detail_count_this_page += 1
+                                    wd.writerow(detail_row_dict)
+
+                            if v_product_id and v_status not in ["준비중", "판매완료"]:
+                                try:
+                                    v_details = get_detail_info(detail_page, v_product_id, logger, img_save_dir=img_save_dir)
+                                    detail_row = {"model_sn": car_counter, "product_id": v_product_id}
+                                    detail_row.update({k: v_details.get(k, "-") for k in detail_headers if k not in ("model_sn", "product_id")})
+                                    detail_row["date_crtr_pnttm"] = pnttm
+                                    detail_row["create_dt"] = create_dt_full
+                                    write_detail_row(detail_row)
+                                    detail_count_this_page += 1
+                                except Exception as de:
+                                    logger.warning(f"상세 수집 실패 (product_id={v_product_id}): {de} → 빈 행 기록")
+                                    detail_row = {k: "-" for k in detail_headers}
+                                    detail_row["model_sn"] = car_counter
+                                    detail_row["product_id"] = v_product_id
+                                    detail_row["date_crtr_pnttm"] = pnttm
+                                    detail_row["create_dt"] = create_dt_full
+                                    write_detail_row(detail_row)
                             else:
-                                # 상세 미수집 시에도 productid/model_sn만 있는 행 추가 (조인용)
+                                # 상세 미수집 시에도 product_id/model_sn만 있는 행 추가 (조인용)
                                 detail_row = {k: "-" for k in detail_headers}
                                 detail_row["model_sn"] = car_counter
-                                detail_row["productid"] = v_product_id
+                                detail_row["product_id"] = v_product_id
                                 detail_row["date_crtr_pnttm"] = pnttm
                                 detail_row["create_dt"] = create_dt_full
-                                with open(detail_path, "a", newline="", encoding="utf-8-sig") as fd:
-                                    wd = csv.DictWriter(fd, fieldnames=detail_headers)
-                                    if car_counter == 1:
-                                        wd.writeheader()
-                                    wd.writerow(detail_row)
+                                write_detail_row(detail_row)
 
                             car_counter += 1
                         except Exception as e:

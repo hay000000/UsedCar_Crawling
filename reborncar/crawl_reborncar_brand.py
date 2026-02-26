@@ -41,7 +41,7 @@ def run_reborn_brand_crawler():
     # WSL 경로 설정
     target_dir = Path("/home/limhayoung/used_car_crawler/result/reborncar")
     target_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = target_dir / "reborncar_brand.csv"
+    csv_path = target_dir / "reborncar_brand_list.csv"
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True) 

@@ -8,8 +8,8 @@ from pathlib import Path
 # --- 로깅 및 경로 설정 ---
 BASE_DIR = Path(__file__).resolve().parent
 
-# RESULT_DIR = Path("./result/heydealer")
-RESULT_DIR = BASE_DIR / "result" / "heydealer"
+# brand/list/detail 모두 프로젝트 루트 result/heydealer 에 저장
+RESULT_DIR = BASE_DIR.parent / "result" / "heydealer"
 LOG_DIR = BASE_DIR / "logs" / "heydealer"
 RESULT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class HeyDealerBrandCrawler:
     def __init__(self):
         self.api_base = "https://api.heydealer.com/v2/customers/web/market/car_meta"
-        self.brand_file = RESULT_DIR / "heydealer_brands_final.csv"
+        self.brand_file = RESULT_DIR / "heydealer_brand_list.csv"
         
         self.session = requests.Session()
         self.session.headers.update({
@@ -93,7 +93,7 @@ class HeyDealerBrandCrawler:
                             "model_group_name": mg_name,
                             "model_id": model.get('hash_id'),
                             "model_name": model.get('name'),
-                            "model_count": model.get('count', 0),
+                            # "model_count": model.get('count', 0),
                             "production_period": model.get('period', ''),
                             "data_crtr_pnttm": d_pnttm, # 8자리 날짜
                             "create_dt": c_dt            # 12자리 날짜 (creat_de 매칭)
@@ -110,7 +110,8 @@ class HeyDealerBrandCrawler:
                     "brand_id", "brand_name", 
                     "model_group_id", "model_group_name", 
                     "model_id", "model_name", 
-                    "model_count", "production_period",
+                    # "model_count", 
+                    "production_period",
                     "data_crtr_pnttm", "create_dt"
                 ]
                 df = df[column_order]
