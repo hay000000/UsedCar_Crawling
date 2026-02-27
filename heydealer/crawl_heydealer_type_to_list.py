@@ -70,9 +70,16 @@ _today_img_dir = IMG_BASE / f"{datetime.now().strftime('%Y')}년" / datetime.now
 print(f"[{datetime.now()}] 🏁 헤이딜러 수집 프로그램 시작")
 print(f"📁 이미지 저장 경로: {_today_img_dir}")
 
+BRAND_CSV_FIELDS = [
+    "brand_id", "brand_name", "model_group_id", "model_group_name",
+    "model_id", "model_name", "production_period", "data_crtr_pnttm", "create_dt"
+]
+
 def fetch_and_save_brand_csv():
     """crawl_heydealer_brand.py와 동일: API로 브랜드·모델 계층 수집 후 brand CSV 저장. 로그는 heydealer_brand_hierarchy.log 사용."""
     log = _logger_brand
+    if BRAND_LIST_FILE.exists():
+        BRAND_LIST_FILE.unlink()
     API_BASE = "https://api.heydealer.com/v2/customers/web/market/car_meta"
     session = requests.Session()
     session.headers.update({
@@ -81,7 +88,7 @@ def fetch_and_save_brand_csv():
     })
     d_pnttm = datetime.now().strftime("%Y%m%d")
     c_dt = datetime.now().strftime("%Y%m%d%H%M")
-    all_data = []
+    n_written = 0
     try:
         log.info("=" * 60)
         log.info("헤이딜러 브랜드-모델 계층 데이터 수집 시작 (날짜 정보 포함)")
@@ -106,7 +113,7 @@ def fetch_and_save_brand_csv():
                 if sub_resp.status_code != 200:
                     continue
                 for model in sub_resp.json().get("models", []):
-                    all_data.append({
+                    row = {
                         "brand_id": brand_id,
                         "brand_name": brand_name,
                         "model_group_id": mg_id,
@@ -116,19 +123,14 @@ def fetch_and_save_brand_csv():
                         "production_period": model.get("period", ""),
                         "data_crtr_pnttm": d_pnttm,
                         "create_dt": c_dt,
-                    })
+                    }
+                    save_to_csv_append(BRAND_LIST_FILE, BRAND_CSV_FIELDS, row)
+                    n_written += 1
                 time.sleep(0.1)
-        if all_data:
-            with open(BRAND_LIST_FILE, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=[
-                    "brand_id", "brand_name", "model_group_id", "model_group_name",
-                    "model_id", "model_name", "production_period", "data_crtr_pnttm", "create_dt"
-                ])
-                writer.writeheader()
-                writer.writerows(all_data)
+        if n_written:
             log.info("=" * 60)
             log.info(f"✅ 수집 완료! 파일: {BRAND_LIST_FILE}")
-            log.info(f"총 수집 모델 수: {len(all_data):,}개")
+            log.info(f"총 수집 모델 수: {n_written:,}개")
             log.info("=" * 60)
         else:
             log.warning("⚠️ 수집된 데이터가 없습니다.")
@@ -167,6 +169,103 @@ def save_to_csv_append(file_path, fieldnames, data_dict):
         if not file_exists:
             writer.writeheader()
         writer.writerow(data_dict)
+
+def download_image(img_url, model_cd, idx):
+    """이미지 다운로드. 저장 경로: imgs/heydealer/연도/YYYYMMDD/model_cd_idx.ext"""
+    try:
+        if not img_url or "svg" in img_url.lower():
+            return False
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Referer": BASE_URL,
+        }
+        response = requests.get(img_url, stream=True, timeout=15, headers=headers)
+        if response.status_code != 200:
+            return False
+        ext = img_url.split(".")[-1].split("?")[0].lower()
+        if len(ext) > 4 or len(ext) < 2:
+            ext = "jpg"
+        now = datetime.now()
+        save_dir = IMG_BASE / f"{now.strftime('%Y')}년" / now.strftime("%Y%m%d")
+        save_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{model_cd}_{idx}.{ext}"
+        save_path = save_dir / filename
+        with open(save_path, "wb") as f:
+            for chunk in response.iter_content(1024):
+                f.write(chunk)
+        return True
+    except Exception:
+        return False
+
+def _collect_images_from_detail_page(page, model_cd):
+    """상세 페이지에서 이미지만 수집·저장 (list_detail_brand와 동일 로직, detail CSV 없음)."""
+    downloaded_urls = set()
+    img_idx = 1
+    try:
+        try:
+            page.wait_for_selector(".css-12qft46", timeout=20000)
+        except Exception:
+            try:
+                page.wait_for_selector(".css-113wzqa", timeout=10000)
+            except Exception:
+                pass
+        page.wait_for_timeout(2000)
+        for i in range(1, 14):
+            page.evaluate(f"window.scrollTo(0, {i * 500})")
+            time.sleep(0.15)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(800)
+        detail_container = page.query_selector(".css-1uus6sd .css-12qft46")
+        if not detail_container:
+            detail_container = page.query_selector(".css-12qft46")
+        if detail_container:
+            ltrevz_sections = detail_container.query_selector_all(".css-ltrevz")
+            if len(ltrevz_sections) >= 2:
+                sec2 = ltrevz_sections[1]
+                for sel in [".css-5pr39e .css-1i3qy3r .css-1dpi6xl button.css-q47uzu img.css-q38rgl", "button.css-q47uzu img.css-q38rgl", "button img, .css-q47uzu img"]:
+                    imgs = sec2.query_selector_all(sel)
+                    if imgs:
+                        for img in imgs:
+                            src = img.get_attribute("src") or img.get_attribute("data-src")
+                            if src and src not in downloaded_urls and "svg" not in src.lower():
+                                if download_image(src, model_cd, img_idx):
+                                    downloaded_urls.add(src)
+                                    img_idx += 1
+                        break
+            if len(ltrevz_sections) >= 4:
+                sec4 = ltrevz_sections[3]
+                for sel in [".css-5pr39e .css-1i3qy3r .css-hf19cn .css-1a3591h img.css-158t7i4", ".css-5pr39e .css-1i3qy3r .css-w9nhgi img.css-158t7i4", ".css-hf19cn .css-1a3591h img", ".css-hf19cn .css-w9nhgi img", ".css-w9nhgi img.css-158t7i4"]:
+                    for img in sec4.query_selector_all(sel):
+                        src = img.get_attribute("src") or img.get_attribute("data-src")
+                        if src and src not in downloaded_urls and "svg" not in src.lower():
+                            if download_image(src, model_cd, img_idx):
+                                downloaded_urls.add(src)
+                                img_idx += 1
+        if img_idx == 1:
+            fallback_imgs = page.query_selector_all("img[src*='heydealer.com'], img[src*='cdn.'], .css-w9nhgi img, .css-1a3591h img, main img")
+            for img in fallback_imgs:
+                src = img.get_attribute("src") or img.get_attribute("data-src")
+                if not src or "svg" in src.lower() or src in downloaded_urls:
+                    continue
+                if download_image(src, model_cd, img_idx):
+                    downloaded_urls.add(src)
+                    img_idx += 1
+        if img_idx == 1:
+            page.wait_for_timeout(2000)
+            for i in range(1, 12):
+                page.evaluate(f"window.scrollTo(0, {i * 600})")
+                time.sleep(0.2)
+            for img in page.query_selector_all("img[src], img[data-src]"):
+                src = img.get_attribute("src") or img.get_attribute("data-src")
+                if not src or "svg" in src.lower() or src in downloaded_urls:
+                    continue
+                if "heydealer" in src or "cdn." in src or len(src) > 20:
+                    if download_image(src, model_cd, img_idx):
+                        downloaded_urls.add(src)
+                        img_idx += 1
+    except Exception as e:
+        print(f"      ❌ 이미지 수집 오류 ({model_cd}): {str(e)[:60]}")
+    return img_idx - 1
 
 def _extract_card_heydealer(elem, idx, brand_map, car_type="", brand_by_name=None) -> dict:
     data = {"model_sn": idx, "brand_id": "", "brand_name": "", "car_type": car_type}
@@ -219,6 +318,8 @@ def main():
 
     if LIST_FILE.exists():
         LIST_FILE.unlink()
+    if CAR_TYPE_LIST_FILE.exists():
+        CAR_TYPE_LIST_FILE.unlink()
 
     print(f"\n🚀 [1단계] 목록 수집을 위해 브라우저를 실행합니다...")
     sys.stdout.flush()
@@ -300,25 +401,25 @@ def main():
             return labels
 
         _open_car_body_panel()
-        page.wait_for_timeout(700)
-        overlay = _get_car_body_overlay()
-        car_type_entries = []  # [(인덱스, 차종명), ...]
+        page.wait_for_timeout(1500)
+        car_type_entries = []
         try:
-            if overlay.count() > 0:
-                car_type_labels = _get_car_type_labels_from_overlay(overlay)
-                car_type_entries = list(enumerate(car_type_labels))
+            for _ in range(2):
+                overlay = _get_car_body_overlay()
+                if overlay.count() > 0:
+                    car_type_labels = _get_car_type_labels_from_overlay(overlay)
+                    if car_type_labels:
+                        car_type_entries = list(enumerate(car_type_labels))
+                        break
+                page.wait_for_timeout(1200)
             if not car_type_entries:
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(1000)
                 car_type_entries = [(0, "")]
             else:
                 print(f" 📌 차종(차체) {len(car_type_entries)}개 (텍스트 기준): {[lbl for _, lbl in car_type_entries]}")
-                # 차종 목록만 따로 CSV 저장 (car_type_sn, car_type_name)
-                with open(CAR_TYPE_LIST_FILE, "w", newline="", encoding="utf-8-sig") as f:
-                    writer = csv.DictWriter(f, fieldnames=["car_type_sn", "car_type_name"])
-                    writer.writeheader()
-                    for sn, (_, car_type_name) in enumerate(car_type_entries, 1):
-                        writer.writerow({"car_type_sn": sn, "car_type_name": car_type_name})
+                for sn, (_, car_type_name) in enumerate(car_type_entries, 1):
+                    save_to_csv_append(CAR_TYPE_LIST_FILE, ["car_type_sn", "car_type_name"], {"car_type_sn": sn, "car_type_name": car_type_name})
                 print(f" 📄 차종 목록 저장: {CAR_TYPE_LIST_FILE}")
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(1000)
@@ -422,10 +523,35 @@ def main():
                     break
 
         print(f"\n📄 목록 CSV 생성 완료: {LIST_FILE} ({len(raw_list)}건)")
-        print(f"\n[{datetime.now()}] ✅ 작업 완료 (brand + car_type + list)")
+        img_total = 0
+        if len(raw_list) > 0:
+            print(f"\n🚀 [2단계] 상세 페이지 이미지 수집")
+            for idx, item in enumerate(raw_list, 1):
+                model_cd = item.get("model_cd", "")
+                detail_url = item.get("detail_url", "")
+                if not detail_url:
+                    continue
+                for retry in range(3):
+                    try:
+                        print(f"   📷 ({idx}/{len(raw_list)}) {model_cd}")
+                        page.goto(detail_url, wait_until="domcontentloaded", timeout=40000)
+                        page.wait_for_load_state("load", timeout=15000)
+                        page.wait_for_timeout(1500)
+                        n_img = _collect_images_from_detail_page(page, model_cd)
+                        img_total += n_img
+                        break
+                    except Exception as e:
+                        if retry < 2:
+                            time.sleep(2)
+                        else:
+                            print(f"      ⚠️ 건너뜀: {str(e)[:50]}")
+            _img_dir = IMG_BASE / f"{datetime.now().strftime('%Y')}년" / datetime.now().strftime("%Y%m%d")
+            print(f"\n📷 이미지 수집 완료: {img_total}장 → {_img_dir}")
+        print(f"\n[{datetime.now()}] ✅ 작업 완료 (brand + car_type + list + 이미지)")
         print(f"   - brand.csv:   {BRAND_LIST_FILE}")
         print(f"   - car_type.csv: {CAR_TYPE_LIST_FILE}")
         print(f"   - list.csv:    {LIST_FILE} ({len(raw_list)}건)")
+        print(f"   - 이미지:      {img_total}장 → {IMG_BASE}/연도/날짜/")
         print(f"   - 결과 폴더:   {RESULT_DIR}")
         print(f"   - 로그:        {LOG_FILE}")
 
