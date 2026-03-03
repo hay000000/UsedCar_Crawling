@@ -14,15 +14,29 @@ from playwright.sync_api import sync_playwright
 def _extract_product_id_from_img_src(src):
     """
     이미지 src에서 product_id 추출.
-    - 3dcarpicture/.../61310405_1/main/... → 61310405
+    - 3dcarpicture/.../61310405_1/main/ 또는 61322118_2/main/ → 숫자만 (61310405, 61322118)
     - kcarM_61320099_045.jpg → 61320099
     """
     if not src:
         return ""
-    m = re.search(r"/(\d+)_1/main/", src)
+    # 숫자_1, 숫자_2 등 /main/ 앞 숫자만
+    m = re.search(r"/(\d+)_\d+/main/", src)
     if m:
         return m.group(1)
     m = re.search(r"kcarM_(\d+)_", src)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _extract_product_id_from_href(href):
+    """상세 링크 href에서 product_id 추출. 예: /bc/detail/61321299 → 61321299"""
+    if not href:
+        return ""
+    m = re.search(r"/detail/(\d+)(?:\?|$|/)", href)
+    if m:
+        return m.group(1)
+    m = re.search(r"detail[/_]?(\d{5,})", href, re.I)
     if m:
         return m.group(1)
     return ""
@@ -633,7 +647,7 @@ def run_kcar_list(page, result_dir: Path, logger):
     if csv_path.exists():
         csv_path.unlink()
     headers = [
-        "product_id", "car_name", "car_exp", "car_pay_meth",
+        "model_sn", "product_id", "car_name", "car_exp", "car_pay_meth",
         "release_dt", "car_navi", "car_fuel", "local_dos", "info_tooltip",
     ]
     url = "https://www.kcar.com/bc/search"
@@ -651,35 +665,97 @@ def run_kcar_list(page, result_dir: Path, logger):
             except Exception:
                 break
 
-        page.wait_for_selector(".carListWrap .carListBox", timeout=60000)
+        # 첫 번째 resultCnt 영역(검색 결과 리스트) 내의 carListBox만 대상
+        page.wait_for_selector(".resultCnt .carListWrap .carListBox", timeout=60000)
         page.wait_for_timeout(2000)
 
-        boxes = page.locator(".carListWrap .carListBox")
+        result_cnt = page.locator(".resultCnt").first
+        boxes = result_cnt.locator(".carListWrap .carListBox")
+
+        # 동적으로 리스트가 추가 로딩될 수 있으므로, 개수가 더 이상 늘어나지 않을 때까지 잠시 대기
+        prev_count = -1
+        stable_rounds = 0
+        for _ in range(10):  # 최대 약 10초
+            cur = boxes.count()
+            if cur == prev_count and cur > 0:
+                stable_rounds += 1
+                if stable_rounds >= 2:
+                    break
+            else:
+                stable_rounds = 0
+                prev_count = cur
+            page.wait_for_timeout(1000)
+
         n_boxes = boxes.count()
         logger.info("검색 결과 리스트 수집: carListBox %d개", n_boxes)
 
-        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(headers)
 
+            model_sn = 0
             for i in range(n_boxes):
                 box = boxes.nth(i)
-                row = []
 
-                # product_id: .carListImg > a.nuxt-link... > img src (3dcarpicture/.../숫자_1/main 또는 kcarM_숫자_)
+                # 화면에 보이게 해서 지연 로딩 이미지 src 채워지도록
                 try:
-                    img = box.locator(".carListImg a[class*='nuxt-link'] img").first
-                    src = img.get_attribute("src") if img.count() else ""
-                    row.append(_extract_product_id_from_img_src(src or ""))
+                    box.scroll_into_view_if_needed()
+                    page.wait_for_timeout(200)
                 except Exception:
-                    row.append("")
+                    pass
+
+                # product_id: 1) .carListImg > a.nuxt-link-exact-active.nuxt-link-active > img src/data-src
+                #              2) 위가 없으면 .carListImg 내 다른 nuxt-link img / img
+                #              3) 그래도 없으면 상세 링크 href에서
+                product_id = ""
+                try:
+                    # 1순위: 요구사항대로 nuxt-link-exact-active.nuxt-link-active 하위 img
+                    img = box.locator(".carListImg a.nuxt-link-exact-active.nuxt-link-active img").first
+                    if not img.count():
+                        # 2순위: nuxt-link 클래스가 있는 다른 a 태그 하위 img
+                        img = box.locator(".carListImg a[class*='nuxt-link'] img").first
+                    if not img.count():
+                        # 3순위: .carListImg 내 첫 번째 img
+                        img = box.locator(".carListImg img").first
+
+                    if img.count():
+                        try:
+                            img.wait_for(state="visible", timeout=1000)
+                            page.wait_for_timeout(300)
+                        except Exception:
+                            pass
+                        src = img.get_attribute("src") or img.get_attribute("data-src") or ""
+                        product_id = _extract_product_id_from_img_src(src or "")
+                except Exception:
+                    pass
+                if not product_id:
+                    try:
+                        for link_sel in (".carListImg a[href*='detail']", "a[href*='detail']", "a[href*='/bc/']"):
+                            link = box.locator(link_sel).first
+                            if link.count():
+                                href = link.get_attribute("href") or ""
+                                product_id = _extract_product_id_from_href(href)
+                                if product_id:
+                                    break
+                    except Exception:
+                        pass
 
                 # car_name: .detailInfo.srchTimedeal .carName .carTit
+                car_name = ""
                 try:
                     el = box.locator(".detailInfo.srchTimedeal .carName .carTit").first
-                    row.append(el.inner_text().strip() if el.count() else "")
+                    car_name = (el.inner_text().strip() if el.count() else "") or ""
                 except Exception:
-                    row.append("")
+                    pass
+
+                # 차량 카드가 아닌 요소(광고/빈 박스)는 건너뜀 → 빈 행 방지, 5번 뒤 7번이 6번으로 밀리는 현상 해소
+                if not product_id and not car_name:
+                    continue
+
+                model_sn += 1
+                row = [model_sn]
+                row.append(product_id)
+                row.append(car_name)
 
                 # car_exp: .carListFlex .carExpIn .carExp
                 try:
@@ -724,12 +800,12 @@ def run_kcar_list(page, result_dir: Path, logger):
                     row.append("")
 
                 w.writerow(row)
-                if (i + 1) % 20 == 0:
-                    logger.info("리스트 수집 진행: %d/%d", i + 1, n_boxes)
+                if model_sn % 20 == 0 and model_sn > 0:
+                    logger.info("리스트 수집 진행: %d건 (박스 %d/%d)", model_sn, i + 1, n_boxes)
 
         logger.info("============================================================")
         logger.info("✅ kcar_list 수집 완료! 파일: %s", csv_path)
-        logger.info("총 %d건", n_boxes)
+        logger.info("총 %d건 (박스 %d개 중)", model_sn, n_boxes)
     except Exception as e:
         logger.error("검색 리스트 수집 오류: %s", e, exc_info=True)
 
@@ -741,12 +817,9 @@ def main():
     result_dir.mkdir(parents=True, exist_ok=True)
 
     # 프로그램 시작 시 기존 CSV 삭제 후 새로 수집
-    # (테스트: 리스트만 실행 시 차종/브랜드 CSV는 삭제하지 않음)
-    for name in (
-        # "kcar_car_type_list.csv",
-        # "kcar_brand_list.csv",
-        "kcar_list.csv",
-    ):
+    # (리스트만 테스트 시 kcar_list.csv만 삭제)
+    for name in ("kcar_car_type_list.csv", "kcar_brand_list.csv", "kcar_list.csv"):
+    # for name in ("kcar_list.csv"):
         path = result_dir / name
         if path.exists():
             path.unlink()
@@ -760,9 +833,9 @@ def main():
         )
         page = context.new_page()
         try:
-            # 차종/브랜드 수집 잠시 비활성화 — 리스트만 테스트
-            # run_kcar_car_type_list(page, result_dir, logger)
-            # run_kcar_brand_list(page, result_dir, logger)
+            # 차종·브랜드 수집 (테스트 시 주석 처리)
+            run_kcar_car_type_list(page, result_dir, logger)
+            run_kcar_brand_list(page, result_dir, logger)
             run_kcar_list(page, result_dir, logger)
         finally:
             browser.close()
