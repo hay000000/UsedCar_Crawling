@@ -80,77 +80,183 @@ def split_boname_by_last_paren(text):
         return text
     return f"{prefix}|{suffix}"
 
+
+def split_model_list_and_period(combined):
+    """'앞부분|(괄호내용)' 형태에서 (model_list, production_period) 반환 (crawl_reborncar_brand.py와 동일)."""
+    if not combined or "|" not in combined:
+        return combined.strip(), ""
+    parts = combined.split("|", 1)
+    return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
+
+
+def normalize_production_period(text):
+    """'(21~24년)' → '21~24', '(23년~현재)' → '23~현재' 형태로 변환."""
+    if not text:
+        return ""
+    s = text.strip()
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    s = s.replace("년", "")
+    return s
+
+
 def run_reborncar_brand(page, result_dir, logger):
-    """브랜드·차종·모델 계층 수집 → reborncar_brand_list.csv (기존 삭제 후 행 단위 append, 중간 끊겨도 유지)."""
+    """브랜드·차종·모델·트림·옵션 계층 수집 → reborncar_brand_list.csv (crawl_reborncar_brand.py와 동일 방식)."""
     now = datetime.now()
     pnttm = now.strftime("%Y%m%d")
     create_dt = now.strftime("%Y%m%d%H%M")
     csv_path = result_dir / "reborncar_brand_list.csv"
-    if csv_path.exists():
-        csv_path.unlink()
-    headers = ["model_sn", "brand_list", "car_list", "model_list", "date_crtr_pnttm", "create_dt"]
+    headers = ["model_sn", "brand_list", "car_list", "model_list", "model_list_1", "model_list_2", "production_period", "date_crtr_pnttm", "create_dt"]
     model_sn = 1
+    row_count = 0
     try:
         logger.info("리본카 브랜드 계층 수집 시작...")
-        page.goto("https://www.reborncar.co.kr/smartbuy/SB1001.rb", wait_until="domcontentloaded", timeout=60000)
+        page.goto("https://www.reborncar.co.kr/smartbuy/SB1001.rb", wait_until="networkidle", timeout=60000)
         page.wait_for_selector(".filter-brand .brand-list", timeout=30000)
         page.wait_for_timeout(1500)
         brand_selectors = page.locator(".filter-brand .brand-list")
         brand_count = brand_selectors.count()
-        for i in range(brand_count):
-            brand_box = brand_selectors.nth(i)
-            brand_list = brand_box.locator(".brand-name label span").inner_text().strip()
-            logger.info(f"[{brand_list}] 처리 중...")
-            brand_box.locator(".brand-name label").click()
-            page.wait_for_timeout(400)
-            car_items = brand_box.locator(".car-list .check-box[class*='car-']")
-            car_count = car_items.count()
-            for j in range(car_count):
-                car_box = car_items.nth(j)
-                car_list = car_box.locator("label span").first.inner_text().strip()
-                car_box.locator("label").first.click()
-                page.wait_for_timeout(300)
-                detail_boxes = car_box.locator(".model-list .check-box")
-                detail_count = detail_boxes.count()
-                if detail_count > 0:
-                    for k in range(detail_count):
-                        full_boname = detail_boxes.nth(k).locator("label span").inner_text().strip()
+
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+
+            for i in range(brand_count):
+                brand_box = brand_selectors.nth(i)
+                brand_list = brand_box.locator(".brand-name label span").inner_text().strip()
+                logger.info(f"[{brand_list}] 처리 중...")
+                brand_box.locator(".brand-name label").click()
+                page.wait_for_timeout(400)
+
+                car_items = brand_box.locator(".car-list .check-box[class*='car-']")
+                car_count = car_items.count()
+
+                for j in range(car_count):
+                    car_box = car_items.nth(j)
+                    car_list = car_box.locator("label span").first.inner_text().strip()
+                    car_box.locator("label").first.click()
+                    page.wait_for_timeout(300)
+
+                    # 모델만 선택 (트림/옵션 check-box 제외: class에 model- 포함된 것만)
+                    detail_boxes = car_box.locator(".model-list .check-box[class*='model-']")
+                    detail_count = detail_boxes.count()
+
+                    if detail_count > 0:
+                        for k in range(detail_count):
+                            model_box = detail_boxes.nth(k)
+                            full_boname = model_box.locator("> label span").inner_text().strip()
+                            model_list_val, production_period_val = split_model_list_and_period(
+                                split_boname_by_last_paren(full_boname)
+                            )
+                            production_period_val = normalize_production_period(production_period_val)
+                            model_box.locator("label").first.click()
+                            page.wait_for_timeout(200)
+
+                            trim_boxes = model_box.locator(".trim-list.depth04 .check-box[class*='trim-']")
+                            trim_count = trim_boxes.count()
+
+                            # 트림이 전혀 없는 모델(예: 더 뉴레이, 레이(11~17년))도 1행으로 수집
+                            if trim_count == 0:
+                                row = {
+                                    "model_sn": model_sn,
+                                    "brand_list": brand_list,
+                                    "car_list": car_list,
+                                    "model_list": model_list_val,
+                                    "model_list_1": "",
+                                    "model_list_2": "",
+                                    "production_period": production_period_val,
+                                    "date_crtr_pnttm": pnttm,
+                                    "create_dt": create_dt
+                                }
+                                writer.writerow(row)
+                                row_count += 1
+                                model_sn += 1
+                                continue
+
+                            for t in range(trim_count):
+                                trim_el = trim_boxes.nth(t)
+                                try:
+                                    trim_name = trim_el.locator("label span").inner_text().strip()
+                                except Exception:
+                                    trim_name = ""
+                                trim_el.locator("label").click()
+                                page.wait_for_timeout(250)
+                                # 현재 트림 요소 안에서만 옵션 조회 (트렌디/프레스티지/노블레스 등 해당 트림 옵션만 수집)
+                                option_boxes = trim_el.locator(".option-list.depth05 .check-box[class*='option-']")
+                                opt_count = option_boxes.count()
+                                if opt_count > 0:
+                                    for o in range(opt_count):
+                                        try:
+                                            option_name = option_boxes.nth(o).locator("label span").inner_text().strip()
+                                        except Exception:
+                                            option_name = ""
+                                        row = {
+                                            "model_sn": model_sn,
+                                            "brand_list": brand_list,
+                                            "car_list": car_list,
+                                            "model_list": model_list_val,
+                                            "model_list_1": trim_name,
+                                            "model_list_2": option_name,
+                                            "production_period": production_period_val,
+                                            "date_crtr_pnttm": pnttm,
+                                            "create_dt": create_dt
+                                        }
+                                        writer.writerow(row)
+                                        row_count += 1
+                                        model_sn += 1
+                                else:
+                                    row = {
+                                        "model_sn": model_sn,
+                                        "brand_list": brand_list,
+                                        "car_list": car_list,
+                                        "model_list": model_list_val,
+                                        "model_list_1": trim_name,
+                                        "model_list_2": "",
+                                        "production_period": production_period_val,
+                                        "date_crtr_pnttm": pnttm,
+                                        "create_dt": create_dt
+                                    }
+                                    writer.writerow(row)
+                                    row_count += 1
+                                    model_sn += 1
+                    else:
+                        car_model_list, car_production_period = split_model_list_and_period(
+                            split_boname_by_last_paren(car_list)
+                        )
+                        car_production_period = normalize_production_period(car_production_period)
                         row = {
-                            "model_sn": model_sn, "brand_list": brand_list, "car_list": car_list,
-                            "model_list": split_boname_by_last_paren(full_boname),
-                            "date_crtr_pnttm": pnttm, "create_dt": create_dt
+                            "model_sn": model_sn,
+                            "brand_list": brand_list,
+                            "car_list": car_list,
+                            "model_list": car_model_list,
+                            "model_list_1": "",
+                            "model_list_2": "",
+                            "production_period": car_production_period,
+                            "date_crtr_pnttm": pnttm,
+                            "create_dt": create_dt
                         }
-                        with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
-                            w = csv.DictWriter(f, fieldnames=headers)
-                            if model_sn == 1:
-                                w.writeheader()
-                            w.writerow(row)
+                        writer.writerow(row)
+                        row_count += 1
                         model_sn += 1
-                else:
-                    row = {
-                        "model_sn": model_sn, "brand_list": brand_list, "car_list": car_list,
-                        "model_list": split_boname_by_last_paren(car_list),
-                        "date_crtr_pnttm": pnttm, "create_dt": create_dt
-                    }
-                    with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
-                        w = csv.DictWriter(f, fieldnames=headers)
-                        if model_sn == 1:
-                            w.writeheader()
-                        w.writerow(row)
-                    model_sn += 1
-        if model_sn > 1:
-            logger.info(f"브랜드 CSV 저장 완료: {csv_path} ({model_sn - 1}행)")
+
+        if row_count > 0:
+            logger.info(f"브랜드 CSV 저장 완료: {csv_path} ({row_count}행)")
         else:
             logger.warning("브랜드 수집 데이터 없음.")
     except Exception as e:
         logger.error(f"브랜드 수집 오류: {e}")
 
 def run_reborncar_car_type(page, result_dir, logger):
-    """차종(car_type) 수집 → reborncar_car_type_list.csv (기존 삭제 후 행 단위 append, 중간 끊겨도 유지)."""
+    """차종(car_type) 수집 → reborncar_car_type_list.csv (cate_cb 제거, 날짜 컬럼 추가)."""
     result_path = result_dir / "reborncar_car_type_list.csv"
     if result_path.exists():
         result_path.unlink()
-    headers = ["car_type_sn", "cate_cb", "car_type_name"]
+    # 시간 정보 생성
+    now = datetime.now()
+    pnttm = now.strftime("%Y%m%d")
+    create_dt = now.strftime("%Y%m%d%H%M")
+    # cate_cb 제거, 날짜 컬럼 추가
+    headers = ["car_type_sn", "car_type_name", "date_crtr_pnttm", "create_dt"]
     car_type_sn = 1
     try:
         logger.info("리본카 차종(car_type) 수집 시작...")
@@ -160,11 +266,15 @@ def run_reborncar_car_type(page, result_dir, logger):
         car_type_elements = page.locator("input.cate-cb[id^='car_type']").all()
         for el in car_type_elements:
             el_id = el.get_attribute("id")
-            cate_cb = el.get_attribute("value")
             label_span = page.locator(f"label[for='{el_id}'] span")
             if label_span.count() > 0:
                 car_type_name = label_span.inner_text().strip()
-                row = {"car_type_sn": car_type_sn, "cate_cb": cate_cb, "car_type_name": car_type_name}
+                row = {
+                    "car_type_sn": car_type_sn,
+                    "car_type_name": car_type_name,
+                    "date_crtr_pnttm": pnttm,
+                    "create_dt": create_dt,
+                }
                 with open(result_path, "a", newline="", encoding="utf-8-sig") as f:
                     w = csv.DictWriter(f, fieldnames=headers)
                     if car_type_sn == 1:
