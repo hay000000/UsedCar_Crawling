@@ -6,10 +6,15 @@ from datetime import datetime
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 
+try:
+    import config
+except ImportError:
+    config = None
+
 def setup_logger():
     log_dir = Path("./logs/reborncar")
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "reborncar_list_detail.log"
+    log_path = log_dir / "reborncar_type_to_list.log"
     logger = logging.getLogger("RebornCar")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
@@ -18,15 +23,28 @@ def setup_logger():
         sh = logging.StreamHandler(); logger.addHandler(sh)
     return logger
 
+def _normalize_composite_key(*parts):
+    """공백 정리 후 한 문자열로 합침 (brand의 model_list+model_list_1+model_list_2, list의 lp_car_name+lp_car_trim 비교용)."""
+    return " ".join((p or "").strip() for p in parts).strip()
+
+
 def load_brand_model_map(result_dir):
-    """reborncar_brand_list.csv 또는 reborncar_brand.csv에서 model_list(| 앞부분) -> brand_list, car_list 매핑 로드."""
+    """reborncar_brand_list.csv 또는 reborncar_brand.csv에서
+    1) model_list(| 앞부분) -> brand_list, car_list 매핑
+    2) (model_list + model_list_1 + model_list_2) full 키 -> (brand_list, car_list, model_list, model_list_1, model_list_2) 5-tuple
+    3) (model_list + model_list_1) 짧은 키 -> 동일 5-tuple
+    4) model_list 단독 -> 5-tuple (car_name에 model_list 포함 시 보완 매칭, 예: 더 뉴봉고Ⅲ화물)
+    을 로드."""
     model_to_brand = {}
     model_to_car_list = {}
+    composite_to_model = {}  # full key -> (brand_list, car_list, model_list, model_list_1, model_list_2)
+    composite_short_to_model = {}  # short key -> 5-tuple
+    model_list_to_row = {}  # model_list -> 5-tuple
     brand_path = result_dir / "reborncar_brand_list.csv"
     if not brand_path.exists():
         brand_path = result_dir / "reborncar_brand.csv"
     if not brand_path.exists():
-        return model_to_brand, model_to_car_list
+        return model_to_brand, model_to_car_list, composite_to_model, composite_short_to_model, model_list_to_row
     try:
         with open(brand_path, "r", encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
@@ -34,16 +52,26 @@ def load_brand_model_map(result_dir):
                 model_list_raw = (row.get("model_list") or "").strip()
                 brand_list = (row.get("brand_list") or "").strip()
                 car_list = (row.get("car_list") or "").strip()
+                model_list_val = model_list_raw.split("|")[0].strip() if model_list_raw else ""
+                model_list_1 = (row.get("model_list_1") or "").strip()
+                model_list_2 = (row.get("model_list_2") or "").strip()
                 if not brand_list:
                     continue
-                # model_list에서 | 앞부분만 키로 사용 (e.g. '올 뉴K3|(18~21년)' -> '올 뉴K3')
-                model_key = model_list_raw.split("|")[0].strip() if model_list_raw else ""
-                if model_key and model_key not in model_to_brand:
-                    model_to_brand[model_key] = brand_list
-                    model_to_car_list[model_key] = car_list if car_list else "-"
+                if model_list_val and model_list_val not in model_to_brand:
+                    model_to_brand[model_list_val] = brand_list
+                    model_to_car_list[model_list_val] = car_list if car_list else "-"
+                row_5 = (brand_list or "-", car_list or "-", model_list_val or "-", model_list_1 or "-", model_list_2 or "-")
+                comp_key = _normalize_composite_key(model_list_val, model_list_1, model_list_2)
+                if comp_key and comp_key not in composite_to_model:
+                    composite_to_model[comp_key] = row_5
+                short_key = _normalize_composite_key(model_list_val, model_list_1)
+                if short_key and short_key not in composite_short_to_model:
+                    composite_short_to_model[short_key] = row_5
+                if model_list_val and model_list_val not in model_list_to_row:
+                    model_list_to_row[model_list_val] = row_5
     except Exception:
         pass
-    return model_to_brand, model_to_car_list
+    return model_to_brand, model_to_car_list, composite_to_model, composite_short_to_model, model_list_to_row
 
 def _get_model_key_for_lp_car_name(lp_car_name, model_keys):
     """lp_car_name으로 model_keys 중 매칭되는 키 반환. 없으면 None."""
@@ -68,6 +96,39 @@ def get_car_list_for_lp_car_name(lp_car_name, model_to_car_list):
     """lp_car_name으로 brand의 model_list(| 앞) 매칭 후 해당 car_list 반환."""
     key = _get_model_key_for_lp_car_name(lp_car_name, model_to_car_list)
     return model_to_car_list.get(key, "-") if key else "-"
+
+
+def get_brand_car_model_for_list_row(lp_car_name, lp_car_trim, composite_to_model, composite_short_to_model=None, model_list_to_row=None):
+    """list의 (lp_car_name + lp_car_trim) = car_name으로 brand 행 매칭 후 (brand_list, car_list, model_list, model_list_1, model_list_2) 5-tuple 반환.
+    1) full 키 / 짧은 키 composite 매칭 (브랜드 첫 단어 제거한 car_name도 시도)
+    2) 실패 시 car_name에 model_list가 포함된 행으로 보완 (예: '더 뉴봉고Ⅲ화물 1.2톤 LPG ...' -> model_list '더 뉴봉고Ⅲ화물')
+    """
+    if composite_short_to_model is None:
+        composite_short_to_model = {}
+    if model_list_to_row is None:
+        model_list_to_row = {}
+    name = (lp_car_name or "").strip()
+    trim = (lp_car_trim or "").strip()
+    car_name_full = _normalize_composite_key(name, trim)
+    parts = name.split(None, 1)
+    car_name_no_first = _normalize_composite_key(parts[1] if len(parts) >= 2 else "", trim)
+
+    for key in (car_name_full, car_name_no_first):
+        if not key:
+            continue
+        if composite_to_model and key in composite_to_model:
+            return composite_to_model[key]
+        if composite_short_to_model and key in composite_short_to_model:
+            return composite_short_to_model[key]
+
+    # 보완: car_name이 brand의 model_list로 시작하는 행 사용 (가장 긴 model_list 우선, 예: 더 뉴봉고Ⅲ화물)
+    for model_list_key in sorted(model_list_to_row.keys(), key=len, reverse=True):
+        if not model_list_key:
+            continue
+        if car_name_full.startswith(model_list_key) or car_name_no_first.startswith(model_list_key):
+            return model_list_to_row[model_list_key]
+
+    return "-", "-", "-", "-", "-"
 
 def split_boname_by_last_paren(text):
     """뒤에서부터 첫 번째 ()를 기준으로 나누어 '앞부분|(괄호내용)' 형태로 반환 (crawl_reborncar_brand.py와 동일)."""
@@ -288,6 +349,36 @@ def run_reborncar_car_type(page, result_dir, logger):
     except Exception as e:
         logger.error(f"차종 수집 오류: {e}")
 
+def save_list_thumbnail(item_locator, page, product_id, save_dir, list_page_url, logger):
+    """목록 아이템의 .lp-thumnail > img 를 product_id_list.png 로 저장. 저장 경로(imgs부터) 반환."""
+    if not product_id or not save_dir:
+        return ""
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    project_root = config.PROJECT_ROOT if (config and hasattr(config, "PROJECT_ROOT")) else Path(__file__).resolve().parent.parent
+    base_url = list_page_url.rsplit("?", 1)[0] if "?" in list_page_url else list_page_url
+    img_el = item_locator.locator(".lp-thumnail img").first
+    if img_el.count() == 0:
+        return ""
+    src = img_el.get_attribute("src")
+    if not src:
+        return ""
+    try:
+        full_url = urljoin(base_url, src) if not (src.startswith("http") or src.startswith("//")) else ("https:" + src if src.startswith("//") else src)
+        resp = page.request.get(full_url)
+        if resp.ok:
+            path = save_dir / f"{product_id}_list.png"
+            path.write_bytes(resp.body())
+            try:
+                rel = path.relative_to(project_root)
+                return str(rel).replace("\\", "/")
+            except ValueError:
+                return f"imgs/reborncar/list/{save_dir.parent.name}/{save_dir.name}/{product_id}_list.png"
+    except Exception as e:
+        logger.warning(f"리스트 썸네일 저장 실패 ({product_id}_list): {e}")
+    return ""
+
+
 def save_detail_images(page, product_id, save_dir, detail_url, logger):
     """상세 페이지 vip-visual 영역 이미지를 product_id_1.png, product_id_2.png ... 로 저장."""
     if not product_id or not save_dir:
@@ -350,13 +441,22 @@ def run_full_crawler():
     list_path = result_dir / "reborncar_list.csv"
     if list_path.exists():
         list_path.unlink()
-    # 이미지 저장: imgs/reborncar/2026년/20260226 형태 (오늘 날짜)
-    img_save_dir = Path(__file__).resolve().parent.parent / "imgs" / "reborncar" / f"{now.year}년" / now.strftime("%Y%m%d")
+    # 이미지 저장 경로: config.py 의 IMG_LIST_REL / IMG_DETAIL_REL["reborncar"] 사용 (헤이딜러와 동일 방식)
+    if config and hasattr(config, "get_list_image_save_dir"):
+        list_img_save_dir = Path(config.get_list_image_save_dir("reborncar", now))
+    else:
+        list_img_save_dir = Path(__file__).resolve().parent.parent / "imgs" / "reborncar" / "list" / f"{now.year}년" / now.strftime("%Y%m%d")
+    if config and hasattr(config, "get_detail_image_save_dir"):
+        img_save_dir = Path(config.get_detail_image_save_dir("reborncar", now))
+    else:
+        img_save_dir = Path(__file__).resolve().parent.parent / "imgs" / "reborncar" / f"{now.year}년" / now.strftime("%Y%m%d")
+    list_img_save_dir.mkdir(parents=True, exist_ok=True)
     img_save_dir.mkdir(parents=True, exist_ok=True)
 
     list_headers = [
-        "model_sn", "product_id", "car_type_name", "brand_list", "car_list", "lp_car_name", "lp_car_trim", "release_dt", "car_navi", "car_seat",
-        "car_main_pay", "amtsel", "status", "copytext", "endtimedeal", "date_crtr_pnttm", "create_dt"
+        "model_sn", "product_id", "car_type_name", "brand_list", "car_list", "model_list", "model_list_1", "model_list_2", "car_name",
+        "release_dt", "car_navi", "car_seat",
+        "car_main_pay", "amtsel", "status", "copytext", "endtimedeal", "detail_url", "car_imgs", "date_crtr_pnttm", "create_dt"
     ]
 
     # [테스트] N페이지까지만 수집 (전체 수집 시 None 유지)
@@ -370,18 +470,18 @@ def run_full_crawler():
 
         try:
             # [0단계] 브랜드 CSV 수집 (crawl_reborncar_brand.py와 동일)
-            logger.info("=" * 50)
-            logger.info("[0단계] 브랜드 계층 수집 → reborncar_brand_list.csv")
-            logger.info("=" * 50)
-            run_reborncar_brand(page, result_dir, logger)
+            # logger.info("=" * 50)
+            # logger.info("[0단계] 브랜드 계층 수집 → reborncar_brand_list.csv")
+            # logger.info("=" * 50)
+            # run_reborncar_brand(page, result_dir, logger)
 
             # [1단계] 차종 CSV 수집 (crawl_reborncar_car_type.py와 동일)
-            logger.info("=" * 50)
-            logger.info("[1단계] 차종 수집 → reborncar_car_type_list.csv")
-            logger.info("=" * 50)
-            run_reborncar_car_type(page, result_dir, logger)
+            # logger.info("=" * 50)
+            # logger.info("[1단계] 차종 수집 → reborncar_car_type_list.csv")
+            # logger.info("=" * 50)
+            # run_reborncar_car_type(page, result_dir, logger)
 
-            brand_model_map, model_to_car_list = load_brand_model_map(result_dir)
+            brand_model_map, model_to_car_list, composite_to_model, composite_short_to_model, model_list_to_row = load_brand_model_map(result_dir)
             detail_page = context.new_page()
 
             # [2단계] 목록 + 이미지 수집 (list.csv, 이미지만 저장 / detail CSV 없음)
@@ -470,18 +570,33 @@ def run_full_crawler():
                             v_copy = "타임딜" if is_td else ""
                             v_endtd = item.locator(".lp-timedeal-count").inner_text().strip() if is_td else ""
 
-                            # list.csv 행 (목록 데이터만, car_type=현재 차종 필터, brand_list=brand 파일 매칭)
+                            # list.csv 행 (목록 데이터만, brand/list 매칭으로 model_list, model_list_1, model_list_2 채움)
                             v_lp_car_name = item.locator(".lp-car-name").inner_text().strip()
+                            v_lp_car_trim = item.locator(".lp-car-trim").inner_text().strip()
+                            v_brand, v_car, v_model_list, v_model_list_1, v_model_list_2 = get_brand_car_model_for_list_row(
+                                v_lp_car_name, v_lp_car_trim, composite_to_model, composite_short_to_model, model_list_to_row
+                            )
+                            if v_brand == "-" and v_car == "-":
+                                v_brand = get_brand_for_lp_car_name(v_lp_car_name, brand_model_map)
+                                v_car = get_car_list_for_lp_car_name(v_lp_car_name, model_to_car_list)
+                            # 상세 URL: productId 쿼리
+                            detail_url_val = f"https://www.reborncar.co.kr/smartbuy/SB1002.rb?productId={v_product_id}" if v_product_id else ""
+                            # 리스트 썸네일: .lp-thumnail > img → product_id_list.png, car_imgs는 imgs부터 경로
+                            list_page_url = page.url
+                            car_imgs_val = save_list_thumbnail(
+                                item, page, v_product_id, list_img_save_dir, list_page_url, logger
+                            ) if v_product_id else ""
+
+                            car_name_val = _normalize_composite_key(v_lp_car_name, v_lp_car_trim)
                             list_row = {
                                 "model_sn": car_counter, "product_id": v_product_id, "car_type_name": current_car_type,
-                                "lp_car_name": v_lp_car_name,
-                                "brand_list": get_brand_for_lp_car_name(v_lp_car_name, brand_model_map),
-                                "car_list": get_car_list_for_lp_car_name(v_lp_car_name, model_to_car_list),
-                                "lp_car_trim": item.locator(".lp-car-trim").inner_text().strip(),
+                                "brand_list": v_brand, "car_list": v_car,
+                                "model_list": v_model_list, "model_list_1": v_model_list_1, "model_list_2": v_model_list_2,
+                                "car_name": car_name_val,
                                 "release_dt": v_year, "car_navi": v_navi, "car_seat": v_seat,
                                 "car_main_pay": v_finamt, "amtsel": v_amtsel, "status": v_status,
                                 "copytext": v_copy, "endtimedeal": v_endtd,
-                                "date_crtr_pnttm": pnttm, "create_dt": create_dt_full
+                                "detail_url": detail_url_val, "car_imgs": car_imgs_val, "date_crtr_pnttm": pnttm, "create_dt": create_dt_full
                             }
                             with open(list_path, "a", newline="", encoding="utf-8-sig") as fl:
                                 wl = csv.DictWriter(fl, fieldnames=list_headers)

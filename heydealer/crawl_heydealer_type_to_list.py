@@ -622,8 +622,6 @@ def _extract_card_heydealer(elem, idx, brand_map, car_type="", brand_by_name=Non
                 data["list_image_url"] = src
         m_box = elem.query_selector(".css-9j6363")
         if m_box:
-            # 차량 풀네임 (예: "더 뉴 모닝 (JA) 시그니처") → car_name
-            data["car_name"] = m_box.inner_text().strip() if m_box else ""
             names = m_box.query_selector_all(".css-jk6asd")
             raw_model_name = names[0].inner_text().strip() if len(names) > 0 else ""
             data["model_name"] = raw_model_name
@@ -648,6 +646,15 @@ def _extract_card_heydealer(elem, idx, brand_map, car_type="", brand_by_name=Non
             data["grade_name"] = grade.inner_text().strip() if grade else ""
             if data["grade_name"]:
                 data["model_list_2"] = data["grade_name"]
+            # 차량 풀네임: 모델명 + 띄어쓰기 + 등급 (예: "더 뉴 레이 시그니처"). 한 span에 "더 뉴 레이시그니처"처럼 붙어 나오면 등급 앞에 공백 삽입
+            grade_name = data.get("grade_name", "")
+            if grade_name and raw_model_name.endswith(" " + grade_name):
+                data["car_name"] = raw_model_name  # 이미 "더 뉴 레이 시그니처" 형태
+            elif grade_name and raw_model_name.endswith(grade_name):
+                base = raw_model_name[: -len(grade_name)].rstrip()
+                data["car_name"] = f"{base} {grade_name}" if base else grade_name
+            else:
+                data["car_name"] = " ".join(p for p in [raw_model_name, grade_name] if p).strip()
         yk_el = elem.query_selector(".css-6bza35")
         if yk_el:
             txt = yk_el.inner_text().strip()
@@ -665,11 +672,10 @@ def _extract_card_heydealer(elem, idx, brand_map, car_type="", brand_by_name=Non
     return data
 
 def main():
-    # --- brand_list.csv / car_type_list.csv 생성은 주석 처리 (파일 생성 안 함) ---
-    # print(f"\n📄 [0단계] 브랜드 API 수집 → heydealer_brand_list.csv 생성")
-    # fetch_and_save_brand_csv()
-    # brand_map, brand_by_name = load_brand_mapping()
-    brand_map, brand_by_name = {}, {}
+    # brand_list.csv / car_type_list.csv 수집 잠깐 생략 시 아래 주석 해제
+    print(f"\n📄 [0단계] 브랜드 API 수집 → heydealer_brand_list.csv 생성")
+    fetch_and_save_brand_csv()
+    brand_map, brand_by_name = load_brand_mapping()
     # heydealer_list.csv 컬럼 순서: brand_list, car_list, model_list, model_list_1, model_list_2, car_name ...
     list_fields = [
         "model_sn",
@@ -693,8 +699,9 @@ def main():
     if LIST_FILE.exists():
         LIST_FILE.unlink()
 
-    # list.csv는 차체별(경∙소형, 세단, SUV∙RV, 쿠페, 리무진, 컨버터블, 해치백)로 수집. API에서 차종만 조회, car_type_list.csv 파일은 생성 안 함.
-    car_type_entries = fetch_filters_car_type_entries()
+    # list.csv는 차체별(경∙소형, 세단, SUV∙RV, 쿠페, 리무진, 컨버터블, 해치백)로 수집. 차종 목록 저장 잠깐 생략 시 아래 주석 유지.
+    print(f"\n📄 [0단계] 차종 API 수집 → heydealer_car_type_list.csv 생성")
+    car_type_entries = fetch_filters_and_save_car_type_list()
     if not car_type_entries:
         car_type_entries = [(0, "")]
         print("   [차종] API 실패 → 필터 없이 전체만 수집합니다.")
