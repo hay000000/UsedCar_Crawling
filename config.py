@@ -8,7 +8,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # 이미지 경로에 쓰는 사이트 목록 (여기만 추가하면 list/detail 경로 자동 생성)
-IMAGE_SITES = ("heydealer", "reborncar", "kcar")
+IMAGE_SITES = ("heydealer", "reborncar", "kcar", "autoinside", "lotterentacar", "hyundaicar")
 
 # 사이트별 리스트/상세 이미지 상대 경로 (공통 패턴: imgs/{site}/list, imgs/{site}/detail)
 IMG_LIST_REL = {site: f"imgs/{site}/list" for site in IMAGE_SITES}

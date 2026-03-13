@@ -12,7 +12,7 @@
 출력:
 - result/hyundaicar/hyundaicar_car_type_list.csv
 - result/hyundaicar/hyundaicar_brand_list.csv
-- result/hyundaicar/hyundaicar_list.csv (검색 결과 목록: product_id, name, release_dt, car_navi, car_num, local_dos, pay, del, sale, flag)
+- result/hyundaicar/hyundaicar_list.csv (검색 결과 목록: product_id, car_name, release_dt, car_navi, car_num, local_dos, pay, del, sale, flag, model_list)
 - logs/hyundaicar/hyundaicar_type_to_list.log
 """
 
@@ -24,12 +24,14 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
+import requests
 from playwright.sync_api import sync_playwright
+from config import get_list_image_save_dir, get_list_image_rel
 
 URL = "https://certified.hyundai.com/p/search/vehicle"
 DETAIL_URL_TEMPLATE = "https://certified.hyundai.com/p/goods/goodsDetail.do?goodsNo={}"
-# 차종별 목록 테스트 수집 개수 (더보기 #btnSeeMore 로 추가 로드)
-LIST_PER_CAR_TYPE = 20
+# 차종별 목록: 0 = 전체 수집(더보기 끝까지), 양수면 해당 건수만 수집
+LIST_PER_CAR_TYPE = 0
 
 
 def _norm(s: str) -> str:
@@ -61,7 +63,7 @@ def _click_if_visible(page, selector: str, logger, timeout_ms: int = 800):
         if el.count() > 0 and el.is_visible(timeout=timeout_ms):
             el.click()
             page.wait_for_timeout(400)
-            logger.info("팝업/버튼 클릭: %s", selector)
+            # logger.info("팝업/버튼 클릭: %s", selector)
             return True
     except Exception:
         return False
@@ -488,6 +490,7 @@ def _load_hyundaicar_brand_map(result_dir: Path, logger):
                         "car": car_key,
                         "brand_list": brand_list,
                         "car_list": car_list,
+                        "model_list": model_list,
                     }
                 )
         logger.info("브랜드 매핑 %d건 로드 (list 매칭용)", len(rows))
@@ -502,7 +505,7 @@ def _find_brand_for_name(name: str, brand_rows):
     1순위: model_list+model_list_1(combined)이 포함되는 행 중 가장 긴 키
     2순위: model_list만 포함되는 행 중 가장 긴 키
     3순위: car_list만 포함되는 행 중 가장 긴 키
-    를 찾아 (brand_list, car_list) 반환.
+    를 찾아 (brand_list, car_list, model_list) 반환.
     """
     if not name or not brand_rows:
         return None
@@ -520,7 +523,7 @@ def _find_brand_for_name(name: str, brand_rows):
             best = row
             best_len = len(key)
     if best:
-        return best["brand_list"], best["car_list"]
+        return best["brand_list"], best["car_list"], best.get("model_list", "")
 
     # 2순위: model
     best = None
@@ -533,7 +536,7 @@ def _find_brand_for_name(name: str, brand_rows):
             best = row
             best_len = len(key)
     if best:
-        return best["brand_list"], best["car_list"]
+        return best["brand_list"], best["car_list"], best.get("model_list", "")
 
     # 3순위: car_list
     best = None
@@ -546,19 +549,18 @@ def _find_brand_for_name(name: str, brand_rows):
             best = row
             best_len = len(key)
     if best:
-        return best["brand_list"], best["car_list"]
+        return best["brand_list"], best["car_list"], best.get("model_list", "")
 
     return None
 
 
 def _extract_list_row_from_li(li, date_crtr_pnttm: str, create_dt: str):
-    """li.type02 한 개에서 product_id, name, release_dt, ... dict 생성."""
+    """li.type02 한 개에서 product_id, car_name, release_dt, ... dict 생성."""
     row = {
         "model_sn": 0,
-        "car_type_name": "",
         "product_id": "",
         "car_type": "",
-        "name": "",
+        "car_name": "",
         "release_dt": "",
         "car_navi": "",
         "car_num": "",
@@ -567,6 +569,7 @@ def _extract_list_row_from_li(li, date_crtr_pnttm: str, create_dt: str):
         "del": "-",
         "sale": "",
         "flag": "",
+        "model_list": "",
         "date_crtr_pnttm": date_crtr_pnttm,
         "create_dt": create_dt,
     }
@@ -577,7 +580,7 @@ def _extract_list_row_from_li(li, date_crtr_pnttm: str, create_dt: str):
             row["product_id"] = _extract_product_id_from_href(href)
         name_el = li.locator(".unit_info .name").first
         if name_el.count() > 0:
-            row["name"] = _norm(name_el.inner_text())
+            row["car_name"] = _norm(name_el.inner_text())
         drive_spans = li.locator(".unit_info .drive span")
         for s in range(min(4, drive_spans.count())):
             val = _norm(drive_spans.nth(s).inner_text())
@@ -603,11 +606,45 @@ def _extract_list_row_from_li(li, date_crtr_pnttm: str, create_dt: str):
     return row
 
 
+def _save_list_thumbnail_from_li(page, li, product_id: str, img_dir: Path, logger) -> str:
+    """
+    목록 li.type02 내 .unit_img 영역에서 썸네일 이미지를 1장 저장하고,
+    저장된 경우 상대 경로( imgs/hyundaicar/list/연도년/날짜/{product_id}_list.png )를 반환.
+    실패 시 빈 문자열 반환.
+    """
+    try:
+        if not product_id:
+            return ""
+        img_el = li.locator(".unit_img img, [class*='unit_img'] img").first
+        if img_el.count() == 0:
+            return ""
+        src = img_el.get_attribute("src") or img_el.get_attribute("data-src")
+        if not src:
+            return ""
+        base_url = page.url if getattr(page, "url", None) else URL
+        abs_url = urljoin(base_url, src)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": base_url,
+        }
+        r = requests.get(abs_url, headers=headers, timeout=15)
+        r.raise_for_status()
+        img_dir.mkdir(parents=True, exist_ok=True)
+        out_path = img_dir / f"{product_id}_list.png"
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+        logger.debug("[list-thumb %s] 목록 썸네일 저장: %s", product_id, out_path)
+        return out_path
+    except Exception as e:
+        logger.debug("[list-thumb %s] 목록 썸네일 저장 실패: %s", product_id, e)
+        return ""
+
+
 def run_hyundaicar_list(page, result_dir: Path, logger):
     """
-    차종(승용, SUV, 승합, EV)별로 선택 → 각 20건 수집(#btnSeeMore 페이징) → 해제 후 다음 차종 반복.
+    차종(승용, SUV, 승합, EV)별로 선택 → 더보기(#btnSeeMore) 끝까지 전체 수집 → 해제 후 다음 차종 반복.
     .search_result .resultlist .product.productlist > li.type02 에서
-    car_type_name, product_id, name, release_dt, car_navi, car_num, local_dos, pay, del, sale, flag 수집.
+    product_id, car_type, car_name, release_dt, car_navi, car_num, local_dos, pay, del, sale, flag, model_list 수집.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     csv_path = result_dir / "hyundaicar_list.csv"
@@ -617,11 +654,11 @@ def run_hyundaicar_list(page, result_dir: Path, logger):
     headers = [
         "model_sn",
         "product_id",
-        "car_type_name",
         "car_type",
         "brand_list",
         "car_list",
-        "name",
+        "model_list",
+        "car_name",
         "release_dt",
         "car_navi",
         "car_num",
@@ -630,12 +667,21 @@ def run_hyundaicar_list(page, result_dir: Path, logger):
         "del",
         "sale",
         "flag",
+        "detail_url",  # 상세 페이지 URL (DETAIL_URL_TEMPLATE 기반)
+        "car_imgs",
         "date_crtr_pnttm",
         "create_dt",
     ]
     now = datetime.now()
     date_crtr_pnttm = now.strftime("%Y%m%d")
     create_dt = now.strftime("%Y%m%d%H%M")
+
+    # 목록 썸네일 이미지 저장 경로: config 공통 경로 사용
+    year_str = f"{now.year}년"
+    date_str = now.strftime("%Y%m%d")
+    list_img_dir = get_list_image_save_dir("hyundaicar", now)
+    list_img_dir.mkdir(parents=True, exist_ok=True)
+    list_img_rel_prefix = f"{get_list_image_rel('hyundaicar')}/{year_str}/{date_str}"
 
     # type02만 수집, type02.banner(광고) 제외
     list_selector = ".search_result .resultlist .product.productlist li.type02:not(.banner)"
@@ -644,7 +690,7 @@ def run_hyundaicar_list(page, result_dir: Path, logger):
 
     try:
         logger.info("============================================================")
-        logger.info("현대 인증중고차 검색 결과 목록 수집 (차종별 %d건)", LIST_PER_CAR_TYPE)
+        logger.info("현대 인증중고차 검색 결과 목록 수집 (차종별 %s)", "전체" if LIST_PER_CAR_TYPE <= 0 else f"{LIST_PER_CAR_TYPE}건")
         logger.info("============================================================")
 
         if URL not in (page.url or ""):
@@ -700,37 +746,74 @@ def run_hyundaicar_list(page, result_dir: Path, logger):
                 items = page.locator(list_selector)
                 if items.count() == 0:
                     items = page.locator(list_selector_fb)
-                need = LIST_PER_CAR_TYPE
-                while items.count() < need:
+                need = LIST_PER_CAR_TYPE if LIST_PER_CAR_TYPE > 0 else None  # None = 전체
+                prev_count = 0
+                no_change_count = 0
+                while True:
+                    n = items.count()
+                    if need is not None and n >= need:
+                        break
                     try:
                         btn = page.locator(btn_more).first
-                        if btn.count() == 0 or not btn.is_visible(timeout=500):
+                        if btn.count() == 0:
+                            break
+                        btn.scroll_into_view_if_needed(timeout=3000)
+                        if not btn.is_visible(timeout=1000):
                             break
                         btn.click()
-                        page.wait_for_timeout(1500)
+                        page.wait_for_timeout(2000)
                         items = page.locator(list_selector)
                         if items.count() == 0:
                             items = page.locator(list_selector_fb)
+                        new_count = items.count()
+                        if new_count == prev_count:
+                            no_change_count += 1
+                            if no_change_count >= 2:
+                                break  # 연속 2번 개수 동일하면 더 이상 없음
+                        else:
+                            no_change_count = 0
+                        prev_count = new_count
                     except Exception:
                         break
+                items = page.locator(list_selector)
+                if items.count() == 0:
+                    items = page.locator(list_selector_fb)
                 n = items.count()
-                to_take = min(need, n)
+                to_take = min(need, n) if need is not None else n
                 logger.info("[%s] 수집 %d건 (전체 %d건)", car_type_name, to_take, n)
                 for i in range(to_take):
                     li = items.nth(i)
                     row = _extract_list_row_from_li(li, date_crtr_pnttm, create_dt)
                     total_written += 1
                     row["model_sn"] = total_written
-                    row["car_type_name"] = car_type_name
                     row["car_type"] = car_type_name
-                    # name 기준으로 브랜드/차종 매핑
-                    if row.get("name") and brand_map:
-                        matched = _find_brand_for_name(row["name"], brand_map)
+                    # car_name 기준으로 브랜드/차종/모델 매핑
+                    if row.get("car_name") and brand_map:
+                        matched = _find_brand_for_name(row["car_name"], brand_map)
                         if matched:
-                            row["brand_list"], row["car_list"] = matched
+                            row["brand_list"], row["car_list"], row["model_list"] = matched
+                    # 상세 페이지 URL: goodsNo=product_id 패턴
+                    pid = row.get("product_id") or ""
+                    row["detail_url"] = DETAIL_URL_TEMPLATE.format(pid) if pid else ""
+                    # 목록 썸네일: unit_img 기준 첫 번째 이미지 저장 후 car_imgs에 경로 기록
+                    thumb_path = ""
+                    try:
+                        thumb_full_path = _save_list_thumbnail_from_li(page, li, row.get("product_id") or "", list_img_dir, logger)
+                        if thumb_full_path:
+                            thumb_path = f"{list_img_rel_prefix}/{row['product_id']}_list.png"
+                    except Exception:
+                        thumb_path = ""
+                    row["car_imgs"] = thumb_path
                     w.writerow(row)
                     f.flush()
-                    logger.info("[%s] %d/%d %s %s", car_type_name, i + 1, to_take, row["product_id"], (row["name"] or "")[:25])
+                    logger.info(
+                        "[%s] %d/%d %s %s",
+                        car_type_name,
+                        i + 1,
+                        to_take,
+                        row["product_id"],
+                        (row.get("car_name") or "")[:25],
+                    )
 
                 label_el.click()
                 page.wait_for_timeout(800)
@@ -756,16 +839,18 @@ def _save_hyundaicar_detail_images(page, product_id: str, save_dir: Path, detail
     urls = []
 
     try:
-        # '이미지 보기' 버튼 클릭 (.btn_img 자체 또는 내부 버튼/링크)
+        # '이미지 보기' 버튼이 보일 때까지 스크롤 후 클릭
         btn = page.locator(".btn_img button, .btn_img a, .btn_img").first
-        if btn.count() > 0 and btn.is_visible(timeout=3000):
-            btn.click()
-            page.wait_for_timeout(1500)
+        if btn.count() > 0:
+            btn.scroll_into_view_if_needed(timeout=5000)
+            if btn.is_visible(timeout=3000):
+                btn.click()
+                page.wait_for_timeout(2000)
 
         # data-ref="uspGallery" 갤러리 영역 대기 (클릭 시 .pdp01_car.ready → .uspGallisOpen 추가됨)
         gallery = page.locator('[data-ref="uspGallery"]').first
-        gallery.wait_for(state="visible", timeout=8000)
-        page.wait_for_timeout(500)
+        gallery.wait_for(state="visible", timeout=10000)
+        page.wait_for_timeout(800)
 
         # 1) .usp_main .usp_main_img (메인 이미지)
         main_img = gallery.locator(".usp_main .usp_main_img img").first
@@ -786,7 +871,7 @@ def _save_hyundaicar_detail_images(page, product_id: str, save_dir: Path, detail
                 if src:
                     urls.append(src)
     except Exception as e:
-        logger.debug("이미지 영역 추출 실패 %s: %s", product_id, e)
+        logger.warning("이미지 영역 추출 실패 %s: %s", product_id, e)
 
     saved = 0
     for idx, src in enumerate(urls, start=1):
@@ -804,11 +889,72 @@ def _save_hyundaicar_detail_images(page, product_id: str, save_dir: Path, detail
     return saved
 
 
+def _update_hyundaicar_list_car_imgs(result_dir: Path, product_id: str, car_imgs_path: str, logger):
+    """hyundaicar_list.csv에서 해당 product_id 행의 car_imgs 컬럼을 경로로 갱신."""
+    list_path = result_dir / "hyundaicar_list.csv"
+    if not list_path.exists():
+        return
+    try:
+        with open(list_path, "r", encoding="utf-8-sig", newline="") as f:
+            r = csv.DictReader(f)
+            fieldnames = list(r.fieldnames or [])
+            rows = list(r)
+        if "car_imgs" not in fieldnames:
+            if "date_crtr_pnttm" in fieldnames:
+                idx = fieldnames.index("date_crtr_pnttm")
+                fieldnames.insert(idx, "car_imgs")
+            else:
+                fieldnames.append("car_imgs")
+            for row in rows:
+                row.setdefault("car_imgs", "")
+        for row in rows:
+            if (row.get("product_id") or "").strip() == product_id:
+                row["car_imgs"] = car_imgs_path
+                break
+        with open(list_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
+    except Exception as e:
+        logger.warning("목록 CSV car_imgs 갱신 실패 %s: %s", product_id, e)
+
+
+def _collect_hyundaicar_images_for_ids(page, product_ids: list, img_dir: Path, car_imgs_path: str, result_dir: Path, logger, max_retries: int = 2):
+    """product_id 목록에 대해 상세 페이지 접속 → 이미지 수집 → car_imgs 갱신. 실패 시 최대 max_retries회 재시도."""
+    for i, product_id in enumerate(product_ids, start=1):
+        detail_url = DETAIL_URL_TEMPLATE.format(product_id)
+        saved = 0
+        for attempt in range(max_retries + 1):
+            try:
+                page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
+                page.wait_for_selector("#CPOwrap, .car_detail_cont, .pdp01_car", timeout=15000)
+                page.wait_for_timeout(800)
+                saved = _save_hyundaicar_detail_images(page, product_id, img_dir, detail_url, logger)
+                if saved > 0:
+                    _update_hyundaicar_list_car_imgs(result_dir, product_id, car_imgs_path, logger)
+                    break
+                if attempt < max_retries:
+                    logger.info("[%s] 이미지 0건, %d회 재시도 예정", product_id, attempt + 1)
+            except Exception as e:
+                logger.warning("[%d/%d] %s 상세 페이지 실패 (시도 %d/%d): %s", i, len(product_ids), product_id, attempt + 1, max_retries + 1, e)
+                if attempt < max_retries:
+                    page.wait_for_timeout(1000)
+            if attempt < max_retries:
+                page.wait_for_timeout(500)
+        if saved == 0:
+            logger.warning("[%d/%d] %s 이미지 수집 실패 (재시도 %d회 후)", i, len(product_ids), product_id, max_retries)
+        if i < len(product_ids):
+            page.wait_for_timeout(500)
+
+
 def run_hyundaicar_detail_images(page, result_dir: Path, logger):
     """
     hyundaicar_list.csv의 product_id로 상세 페이지 접속 후
     이미지 보기 클릭 → data-ref="uspGallery" 내 이미지 수집
     저장: imgs/hyundaicar/YYYY년/YYYYMMDD/product_id_1.png, product_id_2.png ...
+    저장 시 해당 행의 car_imgs 컬럼에 imgs/hyundaicar/년도/년월일 경로 기록.
+    실패 건은 재시도 후, 마지막에 car_imgs 비어 있는 건만 2차 수집.
     """
     list_path = result_dir / "hyundaicar_list.csv"
     if not list_path.exists():
@@ -818,6 +964,7 @@ def run_hyundaicar_detail_images(page, result_dir: Path, logger):
     now = datetime.now()
     img_dir = Path(__file__).resolve().parent.parent / "imgs" / "hyundaicar" / f"{now.year}년" / now.strftime("%Y%m%d")
     img_dir.mkdir(parents=True, exist_ok=True)
+    car_imgs_path = f"imgs/hyundaicar/{now.year}년/{now.strftime('%Y%m%d')}"
     logger.info("이미지 저장 경로: %s", img_dir)
 
     product_ids = []
@@ -837,21 +984,37 @@ def run_hyundaicar_detail_images(page, result_dir: Path, logger):
         return
 
     logger.info("============================================================")
-    logger.info("현대 인증중고차 상세 이미지 수집 시작 (총 %d건)", len(product_ids))
+    logger.info("현대 인증중고차 상세 이미지 수집 시작 (총 %d건, 실패 시 2회 재시도)", len(product_ids))
     logger.info("============================================================")
 
-    for i, product_id in enumerate(product_ids, start=1):
-        detail_url = DETAIL_URL_TEMPLATE.format(product_id)
+    _collect_hyundaicar_images_for_ids(page, product_ids, img_dir, car_imgs_path, result_dir, logger, max_retries=2)
+
+    # 2차: car_imgs가 비어 있는 product_id만 재수집
+    missing = []
+    try:
+        with open(list_path, "r", encoding="utf-8-sig", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                pid = (row.get("product_id") or "").strip()
+                car_imgs = (row.get("car_imgs") or "").strip()
+                if pid and not car_imgs:
+                    missing.append(pid)
+    except Exception as e:
+        logger.warning("car_imgs 빈 목록 읽기 실패: %s", e)
+
+    if missing:
+        logger.info("============================================================")
+        logger.info("car_imgs 미채움 %d건 2차 수집 시작", len(missing))
+        logger.info("============================================================")
+        _collect_hyundaicar_images_for_ids(page, missing, img_dir, car_imgs_path, result_dir, logger, max_retries=2)
+        still_missing = 0
         try:
-            page.goto(detail_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(1500)
-            page.wait_for_selector("#CPOwrap, .car_detail_cont, .pdp01_car", timeout=15000)
-            page.wait_for_timeout(800)
-            _save_hyundaicar_detail_images(page, product_id, img_dir, detail_url, logger)
-        except Exception as e:
-            logger.warning("[%d/%d] %s 상세 페이지 실패: %s", i, len(product_ids), product_id, e)
-        if i < len(product_ids):
-            page.wait_for_timeout(500)
+            with open(list_path, "r", encoding="utf-8-sig", newline="") as f:
+                still_missing = sum(1 for row in csv.DictReader(f) if (row.get("product_id") or "").strip() and not (row.get("car_imgs") or "").strip())
+        except Exception:
+            pass
+        if still_missing > 0:
+            logger.warning("2차 수집 후에도 car_imgs 미채움 %d건 남음", still_missing)
 
     logger.info("============================================================")
     logger.info("✅ 상세 이미지 수집 완료")
@@ -879,10 +1042,13 @@ def main():
         )
         page = context.new_page()
         try:
+            # 차종/브랜드 목록이 필요할 때 아래 주석 해제
             # run_hyundaicar_car_type_list(page, result_dir, logger)
             # run_hyundaicar_brand_list(page, result_dir, logger)
-            # run_hyundaicar_list(page, result_dir, logger)
-            run_hyundaicar_detail_images(page, result_dir, logger)
+
+            # 검색 결과 목록만 수집 (상세 이미지 수집은 비활성화)
+            run_hyundaicar_list(page, result_dir, logger)
+            # run_hyundaicar_detail_images(page, result_dir, logger)
         finally:
             browser.close()
 
