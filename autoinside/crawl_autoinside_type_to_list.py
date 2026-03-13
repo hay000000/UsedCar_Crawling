@@ -11,11 +11,19 @@
 import csv
 import logging
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
 
+# autoinside/ 에서 실행해도 프로젝트 루트의 config 로드 가능하도록
+_root = Path(__file__).resolve().parent.parent
+if str(_root) not in sys.path:
+    sys.path.insert(0, str(_root))
+
 import requests
 from playwright.sync_api import sync_playwright
+
+from config import PROJECT_ROOT, get_detail_image_save_dir, get_list_image_save_dir
 
 # True: Chrome 창 띄워서 브랜드 클릭 수집 (제조사 전환 시 목록 갱신 안정). False: headless.
 # 창 안 띄우려면 실행 전에 AUTOINSIDE_HEADED=0 설정.
@@ -28,9 +36,20 @@ URL_AJAX = "https://www.autoinside.co.kr/display/bu/display_bu_used_car_list_aja
 # wrap > frm > container > ... > category_box cate_model_list > model_list > li
 SELECTOR_LI = "#wrap #frm .container .container_inn .page.page_buy_car_list .car_list_wrap .car_list_wrap_l .car_list_wrap_inn .category_box.cate_model_list .model_list li"
 SELECTOR_LI_FALLBACK = ".cate_model_list .model_list li"
+# 우측 목록: 광고 제외(.banner), img_wrap·car_info 있는 차량만 (무한스크롤 목록 수집용)
+SELECTOR_CAR_ITEM = (
+    "#wrap #frm .container .container_inn .page.page_buy_car_list "
+    ".car_list_wrap .car_list_wrap_r .car_item.tmp_item:not(.banner):has(.img_wrap):has(.car_info)"
+)
 # 국산/수입 라디오: label[for="i_sFlagDiff_N"]=국산, label[for="i_sFlagDiff_Y"]=수입
 # 브랜드 트리: data-type="mnfc"(제조사) → data-type="brnd"(차종) → data-type="model"(모델, label span.nm이 UI와 동일한 값)
 # 클릭은 input[data-type="mnfc"]/input[data-type="brnd"] 사용 시 라벨 가림 방지. 클래스명 변경 시에도 data-type 기준으로 동작.
+
+
+def get_autoinside_imgs_relpath(dt=None):
+    """리스트 이미지 저장 디렉터리(상대 경로). config 기반 imgs/autoinside/list/연도년/YYYYMMDD. dt 생략 시 오늘."""
+    save_dir = get_list_image_save_dir("autoinside", dt)
+    return save_dir.relative_to(PROJECT_ROOT).as_posix()
 
 
 def _norm(s):
@@ -42,7 +61,8 @@ def load_brand_nm_mapping(result_dir: Path):
     """
     autoinside_brand_list.csv에서 brand_list, model_list 컬럼을 읽어
     이은 값(brand_list + ' ' + model_list, 공백 정규화)을 키로,
-    (brand_list, model_list)를 값으로 하는 딕셔너리 반환.
+    (brand_list, car_list, model_list)를 값으로 하는 딕셔너리 반환.
+    list.csv의 car_name에 해당 키가 포함되면 해당 행의 brand_list, car_list, model_list에 매칭값 채움.
     """
     csv_path = result_dir / "autoinside_brand_list.csv"
     out = {}
@@ -53,10 +73,11 @@ def load_brand_nm_mapping(result_dir: Path):
             r = csv.DictReader(f)
             for row in r:
                 bl = (row.get("brand_list") or "").strip()
+                cl = (row.get("car_list") or "").strip()
                 ml = (row.get("model_list") or "").strip()
                 key = _norm(bl + " " + ml)
                 if key:
-                    out[key] = {"brand_list": bl, "model_list": ml}
+                    out[key] = {"brand_list": bl, "car_list": cl, "model_list": ml}
     except Exception:
         pass
     return out
@@ -64,8 +85,8 @@ def load_brand_nm_mapping(result_dir: Path):
 
 def find_brand_match(nm_norm: str, brand_nm_map: dict):
     """
-    brand_nm_map의 키(brand_list+model_list 이은 문자열)가 nm_norm에 포함되어 있으면
-    해당 brand_list·model_list를 반환. 여러 개 매칭 시 가장 긴 키(가장 구체적) 선택.
+    brand_nm_map의 키(brand_list+model_list 이은 문자열)가 nm_norm(car_name)에 포함되어 있으면
+    해당 brand_list, car_list, model_list를 반환. 여러 개 매칭 시 가장 긴 키(가장 구체적) 선택.
     """
     if not nm_norm or not brand_nm_map:
         return None
@@ -497,25 +518,74 @@ def run_autoinside_brand_list(page, result_dir: Path, logger):
         logger.error("브랜드 목록 수집 오류: %s", e, exc_info=True)
 
 
+DETAIL_URL_TEMPLATE = "https://www.autoinside.co.kr/display/bu/display_bu_used_ah_car_view.do?i_sCarCd={product_id}"
+
+
+def download_autoinside_list_image(item_locator, product_id: str, save_dir: Path, logger) -> str | None:
+    """
+    목록 페이지의 한 car_item에서 .img_wrap .main_img 이미지를 다운로드하여
+    save_dir/{product_id}_list.png 로 저장. 저장된 파일의 상대 경로 문자열 반환, 실패 시 None.
+    """
+    if not product_id or not save_dir:
+        return None
+    img_el = None
+    try:
+        loc_inner = item_locator.locator(".img_wrap .main_img img").first
+        loc_inner.wait_for(state="visible", timeout=3000)
+        img_el = loc_inner
+    except Exception:
+        try:
+            loc_main = item_locator.locator(".img_wrap .main_img").first
+            loc_main.wait_for(state="visible", timeout=2000)
+            tag = loc_main.evaluate("el => el.tagName && el.tagName.toUpperCase()")
+            if tag == "IMG":
+                img_el = loc_main
+            else:
+                img_el = item_locator.locator(".img_wrap .main_img img").first
+        except Exception:
+            logger.debug("목록 이미지 요소 없음: %s", product_id)
+            return None
+    if img_el is None:
+        return None
+    try:
+        src = (img_el.get_attribute("data-src") or img_el.get_attribute("src") or "").strip()
+    except Exception:
+        return None
+    if not src:
+        return None
+    if src.startswith("//"):
+        src = "https:" + src
+    elif src.startswith("/"):
+        src = "https://www.autoinside.co.kr" + src
+    try:
+        resp = requests.get(src, timeout=15)
+        resp.raise_for_status()
+    except Exception as e:
+        logger.warning("목록 이미지 다운로드 실패 %s: %s", product_id, e)
+        return None
+    save_path = save_dir / f"{product_id}_list.png"
+    try:
+        save_dir.mkdir(parents=True, exist_ok=True)
+        with open(save_path, "wb") as f:
+            f.write(resp.content)
+    except Exception as e:
+        logger.warning("목록 이미지 저장 실패 %s: %s", save_path, e)
+        return None
+    return save_path.relative_to(PROJECT_ROOT).as_posix()
+
+
 def download_autoinside_images(page, result_dir: Path, logger, product_ids):
     """
     주어진 product_id 목록에 대해 상세 페이지를 열고 메인 이미지를 저장한다.
     - 상세 URL: https://www.autoinside.co.kr/display/bu/display_bu_used_ah_car_view.do?i_sCarCd={product_id}
-    - 이미지 저장 경로: imgs/autoinside/{YYYY}년/{YYYYMMDD}/{product_id}_{순번}.png
+    - 이미지 저장 경로: imgs/autoinside/{YYYY}년/{YYYYMMDD}/{product_id}_{순번}.png (get_autoinside_imgs_relpath와 동일)
     """
     if not product_ids:
         return
 
     try:
-        # 이미지 저장 디렉터리: imgs/autoinside/{YYYY}년/{YYYYMMDD}
-        today = datetime.now()
-        img_dir = (
-            Path(__file__).resolve().parent.parent
-            / "imgs"
-            / "autoinside"
-            / f"{today.year}년"
-            / today.strftime("%Y%m%d")
-        )
+        # 상세 이미지는 config 기반 imgs/autoinside/detail/연도년/YYYYMMDD
+        img_dir = get_detail_image_save_dir("autoinside")
         img_dir.mkdir(parents=True, exist_ok=True)
 
         for idx, pid in enumerate(product_ids, start=1):
@@ -582,18 +652,50 @@ def download_autoinside_images(page, result_dir: Path, logger, product_ids):
         logger.error("이미지 수집 오류: %s", e, exc_info=True)
 
 
+def _scroll_list_until_end(page, item_selector: str, logger, max_no_new_rounds: int = 2, scroll_pause_ms: int = 2000):
+    """
+    무한 스크롤 페이지에서 끝까지 스크롤하여 모든 목록이 DOM에 로드되도록 한다.
+    스크롤 후 item_selector 개수가 더 이상 늘지 않으면 종료.
+    """
+    no_new_rounds = 0
+    last_count = 0
+    while True:
+        try:
+            count = page.locator(item_selector).count()
+        except Exception:
+            count = 0
+        if count == last_count:
+            no_new_rounds += 1
+            if no_new_rounds >= max_no_new_rounds:
+                logger.info("스크롤 완료: 목록 개수 %d로 고정", count)
+                return count
+            page.wait_for_timeout(1000)
+            continue
+        no_new_rounds = 0
+        last_count = count
+        last_height = page.evaluate("document.body.scrollHeight")
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(scroll_pause_ms)
+        new_height = page.evaluate("document.body.scrollHeight")
+        if new_height == last_height:
+            page.wait_for_timeout(1500)
+            if page.evaluate("document.body.scrollHeight") == last_height:
+                logger.info("페이지 끝 도달, 목록 %d개", page.locator(item_selector).count())
+                return page.locator(item_selector).count()
+    return last_count
+
+
 def run_autoinside_list(page, result_dir: Path, logger, max_per_page: int = 5):
     """
     목록 페이지에서 우측 차량 리스트의 요약 정보를 수집하여 autoinside_list.csv 로 저장.
 
     - model_sn: 1,2,3,... (현재 페이지에서의 순번; 테스트용으로 max_per_page 개수까지만 수집)
-    - product_id: img 영역의 li_detail.go_car_detail 요소 id 값
-    - car_spec: car_info > car_spec 의 data-fuel 속성 값
-    - pyy: car_spec 내 .pyy 텍스트
-    - dvml: car_spec 내 .dvml 텍스트
-    - nm: car_info 내 .nm 텍스트
-    - main: car_info > .price > .main 텍스트
-    - sub: car_info > .price > .sub 텍스트 (괄호 제거)
+    - product_id: .img_wrap .li_detail.go_car_detail 요소의 id 값
+    - brand_list, car_list, model_list: brand_list.csv와 nm(car_name) 포함 매칭
+    - car_name: car_info 내 .nm 텍스트 (기존 nm)
+    - car_spec, pyy, dvml, main, sub: 기존과 동일
+    - detail_url: https://...display_bu_used_ah_car_view.do?i_sCarCd={product_id}
+    - car_imgs: 목록 .main_img 이미지 저장 경로 (imgs/autoinside/list/연도년/YYYYMMDD/{product_id}_list.png)
     """
     result_dir.mkdir(parents=True, exist_ok=True)
     csv_path = result_dir / "autoinside_list.csv"
@@ -605,13 +707,16 @@ def run_autoinside_list(page, result_dir: Path, logger, max_per_page: int = 5):
         "product_id",
         "car_type_name",
         "brand_list",
+        "car_list",
         "model_list",
-        "nm",
+        "car_name",
         "car_spec",
         "pyy",
         "dvml",
         "main",
         "sub",
+        "detail_url",
+        "car_imgs",
         "date_crtr_pnttm",
         "create_dt",
     ]
@@ -623,11 +728,7 @@ def run_autoinside_list(page, result_dir: Path, logger, max_per_page: int = 5):
             page.goto(URL, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(2000)
 
-        # 광고 제외(.banner), img_wrap·car_info 있는 차량만
-        items = page.locator(
-            "#wrap #frm .container .container_inn .page.page_buy_car_list "
-            ".car_list_wrap .car_list_wrap_r .car_item.tmp_item:not(.banner):has(.img_wrap):has(.car_info)"
-        )
+        items = page.locator(SELECTOR_CAR_ITEM)
         try:
             items.first.wait_for(state="visible", timeout=8000)
         except Exception:
@@ -642,6 +743,8 @@ def run_autoinside_list(page, result_dir: Path, logger, max_per_page: int = 5):
         limit = min(total_items, max_per_page)
         logger.info("총 %d개 car_item 중 %d개만 테스트 수집", total_items, limit)
 
+        list_img_save_dir = get_list_image_save_dir("autoinside")
+        list_img_save_dir.mkdir(parents=True, exist_ok=True)
         model_sn = 1
         product_ids_for_images = []
         with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
@@ -699,10 +802,18 @@ def run_autoinside_list(page, result_dir: Path, logger, max_per_page: int = 5):
                 except Exception:
                     pass
 
-                # brand_list+model_list 이은 문자열이 nm에 포함되면 brand.csv에서 같은 값으로 채움
+                # brand_list+car_list+model_list 이은 문자열이 nm에 포함되면 brand.csv에서 매칭
                 match = find_brand_match(_norm(nm_val), brand_nm_map) if nm_val else None
                 brand_list_val = (match["brand_list"] or "") if match else ""
+                car_list_val = (match["car_list"] or "") if match else ""
                 model_list_val = (match["model_list"] or "") if match else ""
+
+                # 목록 페이지 .main_img 이미지 다운로드 → {product_id}_list.png, car_imgs에 경로
+                car_imgs_val = ""
+                if product_id:
+                    car_imgs_val = download_autoinside_list_image(item, product_id, list_img_save_dir, logger) or ""
+
+                detail_url_val = DETAIL_URL_TEMPLATE.format(product_id=product_id) if product_id else ""
 
                 now = datetime.now()
                 row = {
@@ -710,20 +821,23 @@ def run_autoinside_list(page, result_dir: Path, logger, max_per_page: int = 5):
                     "product_id": product_id,
                     "car_type_name": "",
                     "brand_list": brand_list_val,
+                    "car_list": car_list_val,
                     "model_list": model_list_val,
-                    "nm": nm_val,
+                    "car_name": nm_val,
                     "car_spec": car_spec_val,
                     "pyy": pyy_val,
                     "dvml": dvml_val,
                     "main": main_val,
                     "sub": sub_val,
+                    "detail_url": detail_url_val,
+                    "car_imgs": car_imgs_val,
                     "date_crtr_pnttm": now.strftime("%Y%m%d"),
                     "create_dt": now.strftime("%Y%m%d%H%M"),
                 }
                 w.writerow(row)
                 f.flush()
                 logger.info(
-                    "[%d/%d] product_id=%s nm=%s",
+                    "[%d/%d] product_id=%s car_name=%s",
                     model_sn,
                     limit,
                     product_id or "-",
@@ -733,16 +847,17 @@ def run_autoinside_list(page, result_dir: Path, logger, max_per_page: int = 5):
 
         logger.info("저장 완료: %s (총 %d건)", csv_path, model_sn - 1)
 
-        # 수집된 product_id들에 대해 상세 이미지를 함께 저장
-        download_autoinside_images(page, result_dir, logger, product_ids_for_images)
+        # 수집된 product_id들에 대해 상세 이미지를 함께 저장 (테스트용 주석)
+        # download_autoinside_images(page, result_dir, logger, product_ids_for_images)
     except Exception as e:
         logger.error("목록(list) 수집 오류: %s", e, exc_info=True)
 
 
-def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type: int = 5):
+def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type: int | None = None):
     """
     상단 차종 카테고리(경소형, 준중형, 중형, 대형, SUV/RV, 스포츠, 승합, 트럭)를
-    하나씩 클릭한 뒤, 각 차종별로 우측 목록에서 최대 max_per_type 개씩 수집.
+    하나씩 클릭한 뒤, 각 차종별로 우측 목록을 무한 스크롤로 끝까지 로드하고 전체 수집.
+    max_per_type이 None이면 해당 차종 전체, 숫자면 테스트용으로 그 개수만 수집.
     결과는 autoinside_list.csv 하나에 누적 저장.
     """
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -755,13 +870,16 @@ def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type
         "product_id",
         "car_type_name",
         "brand_list",
+        "car_list",
         "model_list",
-        "nm",
+        "car_name",
         "car_spec",
         "pyy",
         "dvml",
         "main",
         "sub",
+        "detail_url",
+        "car_imgs",
         "date_crtr_pnttm",
         "create_dt",
     ]
@@ -780,6 +898,8 @@ def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type
             logger.warning("초기 goto 중 오류 발생(무시하고 진행): %s", e)
         page.wait_for_timeout(2000)
 
+        list_img_save_dir = get_list_image_save_dir("autoinside")
+        list_img_save_dir.mkdir(parents=True, exist_ok=True)
         model_sn = 1
         with open(csv_path, "a", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=headers)
@@ -798,28 +918,28 @@ def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type
                     continue
 
                 # 우측 목록: 광고 제외(.banner), img_wrap·car_info 있는 차량만
-                items = page.locator(
-                    "#wrap #frm .container .container_inn .page.page_buy_car_list "
-                    ".car_list_wrap .car_list_wrap_r .car_item.tmp_item:not(.banner):has(.img_wrap):has(.car_info)"
-                )
+                items = page.locator(SELECTOR_CAR_ITEM)
                 try:
                     items.first.wait_for(state="visible", timeout=8000)
                 except Exception:
                     logger.warning("[차종] '%s' 에 대한 car_item(광고 제외, img_wrap·car_info 있음) 요소를 찾지 못했습니다.", car_type_name)
                     continue
 
+                # 무한 스크롤: 끝까지 스크롤하여 전체 목록 로드
+                logger.info("[차종] '%s' 무한 스크롤로 전체 목록 로드 중", car_type_name)
+                _scroll_list_until_end(page, SELECTOR_CAR_ITEM, logger)
+                items = page.locator(SELECTOR_CAR_ITEM)
                 total_items = items.count()
                 if total_items == 0:
                     logger.info("[차종] '%s' 목록이 비어 있습니다.", car_type_name)
                     continue
 
-                logger.info("[차종] '%s' car_item %d개 중 유효한 %d개 테스트 수집", car_type_name, total_items, max_per_type)
+                limit = min(total_items, max_per_type) if max_per_type is not None else total_items
+                logger.info("[차종] '%s' car_item 전체 %d개 중 %d개 수집", car_type_name, total_items, limit)
                 product_ids_for_images = []
                 collected = 0
 
-                for i in range(total_items):
-                    if collected >= max_per_type:
-                        break
+                for i in range(limit):
                     item = items.nth(i)
                     try:
                         detail_el = item.locator(".img_wrap .li_detail.go_car_detail").first
@@ -869,10 +989,18 @@ def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type
                         product_ids_for_images.append(product_id)
                     collected += 1
 
-                    # brand_list+model_list 이은 문자열이 nm에 포함되면 brand.csv에서 같은 값으로 채움
+                    # brand_list+car_list+model_list 이은 문자열이 nm에 포함되면 brand.csv에서 매칭
                     match = find_brand_match(_norm(nm_val), brand_nm_map) if nm_val else None
                     brand_list_val = (match["brand_list"] or "") if match else ""
+                    car_list_val = (match["car_list"] or "") if match else ""
                     model_list_val = (match["model_list"] or "") if match else ""
+
+                    # 목록 페이지 .main_img 이미지 다운로드 → {product_id}_list.png, car_imgs에 경로
+                    car_imgs_val = ""
+                    if product_id:
+                        car_imgs_val = download_autoinside_list_image(item, product_id, list_img_save_dir, logger) or ""
+
+                    detail_url_val = DETAIL_URL_TEMPLATE.format(product_id=product_id) if product_id else ""
 
                     now = datetime.now()
                     row = {
@@ -880,20 +1008,23 @@ def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type
                         "product_id": product_id,
                         "car_type_name": car_type_name,
                         "brand_list": brand_list_val,
+                        "car_list": car_list_val,
                         "model_list": model_list_val,
-                        "nm": nm_val,
+                        "car_name": nm_val,
                         "car_spec": car_spec_val,
                         "pyy": pyy_val,
                         "dvml": dvml_val,
                         "main": main_val,
                         "sub": sub_val,
+                        "detail_url": detail_url_val,
+                        "car_imgs": car_imgs_val,
                         "date_crtr_pnttm": now.strftime("%Y%m%d"),
                         "create_dt": now.strftime("%Y%m%d%H%M"),
                     }
                     w.writerow(row)
                     f.flush()
                     logger.info(
-                        "[%d] 차종=%s product_id=%s nm=%s",
+                        "[%d] 차종=%s product_id=%s car_name=%s",
                         model_sn,
                         car_type_name,
                         product_id or "-",
@@ -901,8 +1032,8 @@ def run_autoinside_list_by_car_type(page, result_dir: Path, logger, max_per_type
                     )
                     model_sn += 1
 
-                # 해당 차종에 대해 수집된 product_id들로 이미지 저장
-                download_autoinside_images(page, result_dir, logger, product_ids_for_images)
+                # 해당 차종에 대해 수집된 product_id들로 상세 페이지 속 이미지 저장 (테스트용 주석)
+                # download_autoinside_images(page, result_dir, logger, product_ids_for_images)
 
                 # 이미지 수집 후 목록 페이지로 복귀해야 다음 차종(준중형, 중형 등) 버튼을 찾을 수 있음
                 try:
@@ -927,12 +1058,9 @@ def main():
             browser = p.chromium.launch(headless=headless)
         try:
             page = browser.new_page()
-            # car_type_list는 이미 수집이 끝났고, 지금은 차종별 목록 테스트만 수행.
+            # [테스트] list.csv + 이미지만 수행 (차종/브랜드 목록 수집 생략)
             # logger_ct = setup_logger("car_type_list")
             # run_autoinside_car_type_list(page, result_dir, logger_ct)
-
-            # brand_list는 이미 수집이 끝났고, 실행 시간이 길기 때문에
-            # 테스트 시에는 아래 블록을 비활성화한다.
             # logger_br = setup_logger("brand_list")
             # if USE_AJAX_FOR_BRAND:
             #     run_autoinside_brand_list_via_ajax(result_dir, logger_br)
@@ -940,7 +1068,8 @@ def main():
             #     run_autoinside_brand_list(page, result_dir, logger_br)
 
             logger_list = setup_logger("list")
-            run_autoinside_list_by_car_type(page, result_dir, logger_list, max_per_type=5)
+            # list.csv 전체 목록 수집 + car_imgs 컬럼(이미지 경로) append + list 목록 이미지 저장
+            run_autoinside_list_by_car_type(page, result_dir, logger_list, max_per_type=None)
         finally:
             browser.close()
 

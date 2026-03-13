@@ -6,11 +6,19 @@ K Car 검색 페이지(https://www.kcar.com/bc/search)에서
 import csv
 import logging
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
 
+# kcar/ 에서 실행해도 config import 가능하도록 프로젝트 루트 추가
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from playwright.sync_api import sync_playwright
+
+from config import PROJECT_ROOT, get_list_image_save_dir
 
 
 def _extract_product_id_from_img_src(src):
@@ -856,7 +864,7 @@ def _normalize_key(s):
 
 def _load_brand_list_lookup(result_dir: Path):
     """
-    kcar_brand_list.csv를 읽어, car_name 매칭용 키 -> (brand_list, car_list) 딕셔너리 반환.
+    kcar_brand_list.csv를 읽어, car_name 매칭용 키 -> (brand_list, car_list, model_list, model_list_1, model_list_2) 딕셔너리 반환.
     list 페이지 car_name이 '기아 올 뉴 모닝 (JA) 럭셔리'처럼 car_list(모닝) 없이 나오므로,
     키 두 종류 등록: (1) brand+car+model+m1+m2 (2) brand+model+m1+m2 (car 제외).
     """
@@ -880,7 +888,7 @@ def _load_brand_list_lookup(result_dir: Path):
                 parts_no_car = [p for p in [brand, model, m1] if p]
                 if m2 and m2 != "-":
                     parts_no_car.append(m2)
-                value = (brand or "-", car or "-")
+                value = (brand or "-", car or "-", model or "-", m1 or "-", m2 or "-")
                 for parts in (parts_full, parts_no_car):
                     key = _normalize_key(" ".join(parts))
                     if key:
@@ -890,17 +898,38 @@ def _load_brand_list_lookup(result_dir: Path):
     return lookup
 
 
+def _download_list_image(page, img_src: str, save_path: Path, logger) -> bool:
+    """이미지 URL을 save_path에 다운로드. 성공 시 True."""
+    if not img_src or not img_src.startswith("http"):
+        return False
+    try:
+        response = page.request.get(img_src, timeout=15000)
+        if response.ok:
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(response.body())
+            return True
+    except Exception as e:
+        logger.debug("리스트 이미지 다운로드 실패 %s: %s", img_src[:80], e)
+    return False
+
+
 def run_kcar_list(page, result_dir: Path, logger):
     # result/kcar/kcar_list.csv (DOM: .resultCnt .carListWrap .carListBox 기준)
     csv_path = result_dir / "kcar_list.csv"
     headers = [
-        "model_sn", "product_id",  "car_type_name", "brand_list", "car_list", "car_name",
-        "car_exp", "car_pay_meth", "release_dt", "car_navi", "car_fuel", "local_dos",
+        "model_sn", "product_id", "car_type_name", "brand_list", "car_list",
+        "model_list", "model_list_1", "model_list_2",
+        "car_name", "car_exp", "car_pay_meth", "release_dt", "car_navi", "car_fuel", "local_dos",
+        "detail_url", "car_imgs",
         "date_crtr_pnttm", "create_dt",
     ]
 
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         csv.writer(f).writerow(headers)
+
+    # 리스트 이미지 저장 경로: imgs/kcar/list/2026년/20260313 (config 공통)
+    save_dir = get_list_image_save_dir("kcar")
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     brand_lookup = _load_brand_list_lookup(result_dir)
     if brand_lookup:
@@ -967,12 +996,17 @@ def run_kcar_list(page, result_dir: Path, logger):
                             continue
                         box.scroll_into_view_if_needed()
 
-                        # A. product_id: .carListImg 아래 a 아래 img src에서 추출
+                        # A. product_id 및 리스트 이미지: .carListImg 내 #mkt_clickCar img 또는 .carListImg a img
                         product_id = ""
-                        img_el = box.locator(".carListImg a img").first
+                        img_el = box.locator(".carListImg #mkt_clickCar img").first
+                        if img_el.count() == 0:
+                            img_el = box.locator(".carListImg a img").first
+                        if img_el.count() == 0:
+                            img_el = box.locator(".carListImg img").first
+                        img_src = ""
                         if img_el.count() > 0:
-                            src = img_el.get_attribute("src")
-                            product_id = _extract_product_id_from_img_src(src or "")
+                            img_src = img_el.get_attribute("src") or ""
+                            product_id = _extract_product_id_from_img_src(img_src)
                         if not product_id:
                             link_el = box.locator("a[href*='/detail/']").first
                             if link_el.count() > 0:
@@ -1024,18 +1058,29 @@ def run_kcar_list(page, result_dir: Path, logger):
                             model_sn += 1
                             # list.csv에는 product_id를 EC 접두사 붙여서 저장 (예: EC61320372)
                             product_id_out = ("EC" + product_id) if product_id and not str(product_id).strip().upper().startswith("EC") else (product_id or "-")
-                            # car_name으로 brand_list.csv 매칭 (키 = brand_list+model_list+model_list_1[+model_list_2])
-                            brand_list_val = "-"
-                            car_list_val = "-"
+                            # car_name으로 brand_list.csv 매칭 (brand_list, car_list, model_list, model_list_1, model_list_2)
+                            brand_list_val = car_list_val = model_list_val = model_list_1_val = model_list_2_val = "-"
                             if car_name and brand_lookup:
                                 key = _normalize_key(car_name)
                                 matched = brand_lookup.get(key)
                                 if matched:
-                                    brand_list_val, car_list_val = matched
+                                    brand_list_val, car_list_val, model_list_val, model_list_1_val, model_list_2_val = matched
+                            # 상세 URL: i_sCarCd=product_id
+                            detail_url = "https://www.kcar.com/bc/detail/carInfoDtl?i_sCarCd=" + product_id_out if product_id_out != "-" else "-"
+                            # 리스트 이미지 다운로드: {product_id_out}_list.png → car_imgs에 상대 경로 저장
+                            car_imgs_val = "-"
+                            if product_id_out != "-":
+                                list_img_path = save_dir / f"{product_id_out}_list.png"
+                                if img_src and _download_list_image(page, img_src, list_img_path, logger):
+                                    try:
+                                        car_imgs_val = (list_img_path.relative_to(PROJECT_ROOT).as_posix())
+                                    except ValueError:
+                                        car_imgs_val = str(list_img_path)
                             row = [
-                                model_sn, product_id_out, car_type_name, brand_list_val, car_list_val, car_name,
-                                car_exp, car_pay_meth, release_dt, car_navi, car_fuel, local_dos,
-                                # info_tooltip,
+                                model_sn, product_id_out, car_type_name, brand_list_val, car_list_val,
+                                model_list_val, model_list_1_val, model_list_2_val,
+                                car_name, car_exp, car_pay_meth, release_dt, car_navi, car_fuel, local_dos,
+                                detail_url, car_imgs_val,
                                 base_date_crtr_pnttm, base_create_dt,
                             ]
                             writer.writerow(row)
@@ -1236,9 +1281,9 @@ def main():
             # 차종·브랜드 수집 (테스트 시 주석 처리)
             # run_kcar_car_type_list(page, result_dir, logger)
             # run_kcar_brand_list(page, result_dir, logger)
-            # run_kcar_list(page, result_dir, logger)
+            run_kcar_list(page, result_dir, logger)
             # list 수집 후 상세 페이지 갤러리 이미지 저장 (imgs/kcar/2026년/YYYYMMDD/EC61320372_1.png ...)
-            run_kcar_detail_images(page, result_dir, logger)
+            # run_kcar_detail_images(page, result_dir, logger)
         finally:
             browser.close()
 
