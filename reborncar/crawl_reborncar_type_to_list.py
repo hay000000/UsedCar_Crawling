@@ -12,7 +12,8 @@ except ImportError:
     config = None
 
 def setup_logger():
-    log_dir = Path("./logs/reborncar")
+    project_root = config.PROJECT_ROOT if (config and hasattr(config, "PROJECT_ROOT")) else Path(__file__).resolve().parent.parent
+    log_dir = project_root / "logs" / "reborncar"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "reborncar_type_to_list.log"
     logger = logging.getLogger("RebornCar")
@@ -470,16 +471,16 @@ def run_full_crawler():
 
         try:
             # [0단계] 브랜드 CSV 수집 (crawl_reborncar_brand.py와 동일)
-            # logger.info("=" * 50)
-            # logger.info("[0단계] 브랜드 계층 수집 → reborncar_brand_list.csv")
-            # logger.info("=" * 50)
-            # run_reborncar_brand(page, result_dir, logger)
+            logger.info("=" * 50)
+            logger.info("[0단계] 브랜드 계층 수집 → reborncar_brand_list.csv")
+            logger.info("=" * 50)
+            run_reborncar_brand(page, result_dir, logger)
 
             # [1단계] 차종 CSV 수집 (crawl_reborncar_car_type.py와 동일)
-            # logger.info("=" * 50)
-            # logger.info("[1단계] 차종 수집 → reborncar_car_type_list.csv")
-            # logger.info("=" * 50)
-            # run_reborncar_car_type(page, result_dir, logger)
+            logger.info("=" * 50)
+            logger.info("[1단계] 차종 수집 → reborncar_car_type_list.csv")
+            logger.info("=" * 50)
+            run_reborncar_car_type(page, result_dir, logger)
 
             brand_model_map, model_to_car_list, composite_to_model, composite_short_to_model, model_list_to_row = load_brand_model_map(result_dir)
             detail_page = context.new_page()
